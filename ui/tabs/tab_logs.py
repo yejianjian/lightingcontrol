@@ -49,6 +49,7 @@ class TabLogs(QWidget):
 
         self.txt_logs = QPlainTextEdit()
         self.txt_logs.setReadOnly(True)
+        self.txt_logs.setMaximumBlockCount(5000)  # 限制最大行数，防止内存无限增长
         # 用深色背景贴合开发者习惯
         self.txt_logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, Courier New, monospace;")
         layout.addWidget(self.txt_logs)

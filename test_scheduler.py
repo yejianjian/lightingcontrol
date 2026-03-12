@@ -1,46 +1,42 @@
 import asyncio
 from datetime import datetime
-from utils.logger import global_logger
-import traceback
+
+class DummyLogger:
+    def info(self, msg): print(f"[INFO] {msg}")
+    def error(self, msg): print(f"[ERROR] {msg}")
+    def warning(self, msg): print(f"[WARNING] {msg}")
+
+global_logger = DummyLogger()
+
+class DummyDM:
+    class DummyPM:
+        def get_schedules(self):
+            return [{"enabled": True, "time": datetime.now().strftime("%H:%M"), "group": "test", "action": True}]
+        def get_groups(self):
+            return {"test": ["1", "2"]}
+    pm = DummyPM()
+
+class DummyEngine:
+    connected = True
+    async def write_node_value(self, nid, action):
+        print(f"Writing to {nid}: {action}")
 
 class GroupScheduler:
-    """
-    后台常驻调度器，基于 asyncio 协程，
-    读取 PersistenceManager 里的时间表，到达触发时间后向 OpcClientEngine 下发控制任务。
-    """
-    def __init__(self, data_manager, opc_engine):
-        self.dm = data_manager
-        self.engine = opc_engine
+    def __init__(self, dm, engine):
+        self.dm = dm
+        self.engine = engine
         self.running = False
         self._task = None
 
     def start(self):
         if not self.running:
             self.running = True
-            
-            # 使用更安全的 ensure_future，或者避免在事件循环尚未 run_forever 之前挂起
-            # 为防 QEventLoop (qasync) 丢弃初期任务，我们延时将调度器推入准备好的消息队列中
-            def _launch_task():
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = asyncio.get_event_loop()
-                self._task = loop.create_task(self._scheduler_loop())
-                global_logger.info("Group Scheduler core routine spawned into event loop.")
-            
-            # 延后 500 毫秒推入，确保 qasync.run_forever 已经接管
             loop = asyncio.get_event_loop()
-            loop.call_later(0.5, _launch_task)
-            global_logger.info("Group Scheduler daemon start scheduled.")
-
-    def stop(self):
-        self.running = False
-        if self._task:
-            self._task.cancel()
-            global_logger.info("Group Scheduler daemon stopped.")
+            self._task = loop.create_task(self._scheduler_loop())
+            print("Scheduler started")
 
     async def _scheduler_loop(self):
-        global_logger.info("Group Scheduler background tick loop actually started running.")
+        print("Loop started")
         last_triggered_minute = -1
         while self.running:
             try:
@@ -66,12 +62,10 @@ class GroupScheduler:
                             
                     last_triggered_minute = current_minute
                     
-            except asyncio.CancelledError:
-                break
             except Exception as e:
-                global_logger.error(f"Scheduler error: {e}\n{traceback.format_exc()}")
+                global_logger.error(f"Scheduler error: {e}")
                 
-            await asyncio.sleep(2)  # 每2秒探测一次，防止错过
+            await asyncio.sleep(2)  # 每2秒探测一次
 
     async def _execute_group_action(self, group_name, action):
         if not self.engine.connected:
@@ -84,10 +78,16 @@ class GroupScheduler:
              return
 
         def _task_err_callback(t):
-            if not t.cancelled() and t.exception():
+            if t.exception():
                 global_logger.error(f"Scheduled write task failed: {t.exception()}")
 
         for nid in members:
-            # 不需要等待每一个结果同步，将其推向后台即可实现并行执行
             task = asyncio.ensure_future(self.engine.write_node_value(nid, action))
             task.add_done_callback(_task_err_callback)
+
+async def main():
+    gs = GroupScheduler(DummyDM(), DummyEngine())
+    gs.start()
+    await asyncio.sleep(5)
+
+asyncio.run(main())

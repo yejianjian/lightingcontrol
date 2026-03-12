@@ -10,6 +10,7 @@ class TabSettings(QWidget):
     def __init__(self, opc_engine, data_manager):
         super().__init__()
         self.engine = opc_engine
+        self.engine.on_connection_lost = self._handle_connection_lost
         self.dm = data_manager
         self._setup_ui()
 
@@ -46,6 +47,13 @@ class TabSettings(QWidget):
         layout.addStretch()
 
     def on_connect_clicked(self):
+        if getattr(self, '_is_reconnecting', False):
+            self._is_reconnecting = False
+            self.btn_connect.setText("已请求停止自动重连... 正在断开")
+            self.btn_connect.setEnabled(False)
+            asyncio.create_task(self._disconnect())
+            return
+            
         if not self.engine.connected:
             self.engine.host = self.le_host.text().strip()
             # 端口合法性校验
@@ -87,6 +95,11 @@ class TabSettings(QWidget):
             # 开始订阅并把回调接给数据总线
             await self.engine.start_subscription(self._on_sub_data)
             
+            # 启动调度器（如果尚未运行）
+            main_win = self.window()
+            if hasattr(main_win, 'scheduler') and not main_win.scheduler.running:
+                main_win.scheduler.start()
+            
             self.btn_connect.setText("断开服务器连接")
             self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
             
@@ -106,7 +119,61 @@ class TabSettings(QWidget):
         # 接收到底层推送，交给DataManager中心处理合并 (顺带触发UI统计渲染)
         self.dm.update_node(node_id, {"value": value, "timestamp": timestamp})
 
+    def _handle_connection_lost(self):
+        global_logger.warning("UI caught connection lost event. Initiating auto-reconnect sequence.")
+        
+        if hasattr(self.window(), 'lbl_dash_mode'):
+            self.window().lbl_dash_mode.setText("系统状态 (连接断开，尝试重连中...)")
+            self.window().lbl_dash_mode.setStyleSheet("background-color: #ffccc7; color: #cf1322; border: 1px solid #ffa39e; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+            
+        self.btn_connect.setEnabled(True)
+        self.btn_connect.setText("停止自动重连")
+        self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+        self._is_reconnecting = True
+        
+        asyncio.create_task(self._auto_reconnect_loop())
+        
+    async def _auto_reconnect_loop(self):
+        try:
+            while getattr(self, '_is_reconnecting', False) and not self.engine.connected:
+                await asyncio.sleep(5)
+                if self.engine.connected or not getattr(self, '_is_reconnecting', False):
+                    break
+                    
+                self.btn_connect.setText("正在尝试建立连接...")
+                try:
+                    await self.engine.disconnect()
+                except Exception:
+                    pass
+                
+                try:
+                    global_logger.info(f"Auto-Reconnecting to {self.engine.url}...")
+                    await self.engine.connect()
+                    nodes = await self.engine.get_all_nodes()
+                    for n in nodes:
+                        self.dm.update_node(n['node_id'], n)
+                    await self.engine.start_subscription(self._on_sub_data)
+                    
+                    self.btn_connect.setText("断开服务器连接")
+                    self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+                    if hasattr(self.window(), 'lbl_dash_mode'):
+                        self.window().lbl_dash_mode.setText(f"系统状态 (已连接: {self.engine.host})")
+                        self.window().lbl_dash_mode.setStyleSheet("background-color: #8C9EFF; color: white; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+                    
+                    self._is_reconnecting = False
+                    break
+                except Exception as e:
+                    global_logger.error(f"Auto-reconnect failed: {e}")
+                    if getattr(self, '_is_reconnecting', False):
+                        self.btn_connect.setText("停止自动重连 (下次在5秒后...)")
+                        if hasattr(self.window(), 'lbl_dash_mode'):
+                             self.window().lbl_dash_mode.setText("系统状态 (重连失败，定时重试中...)")
+        finally:
+            if not self.engine.connected and not getattr(self, '_is_reconnecting', False):
+                pass
+
     async def _disconnect(self):
+        self._is_reconnecting = False
         await self.engine.disconnect()
         self.btn_connect.setText("连接并挂载服务器节点")
         self.btn_connect.setEnabled(True)

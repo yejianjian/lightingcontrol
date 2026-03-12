@@ -49,11 +49,10 @@ class MainWindow(QMainWindow):
         # 核心数据与引擎
         self.pm = PersistenceManager()
         self.dm = DataManager(self.pm)
-        self.opc_engine = OpcClientEngine(None, None) # Params injected via settings tab later
+        self.opc_engine = OpcClientEngine()  # 参数由设置页注入
         
-        # 挂载自动定时调度引擎
+        # 调度器挂载但不立即启动（等 OPC 连接成功后再启动）
         self.scheduler = GroupScheduler(self.dm, self.opc_engine)
-        self.scheduler.start()
         
         self._setup_ui()
         self._bind_events()
@@ -179,12 +178,21 @@ class MainWindow(QMainWindow):
         # 鉴权弹窗，阻止误关（使用顶层已导入的 QInputDialog/QLineEdit）
         text, ok = QInputDialog.getText(self, "安全锁", "正在尝试退出集控系统。\n请输入退出授权密码:", QLineEdit.Password)
         
-        if ok and text == "8888":
-            if self.opc_engine.connected:
-                asyncio.ensure_future(self.opc_engine.disconnect())
+        exit_password = self.pm.data_store.get("exit_password", "8888")
+        if ok and text == exit_password:
+            # 停止所有定时器
+            self.refresh_timer.stop()
+            self.clock_timer.stop()
+            # 停止调度器
             if hasattr(self, 'scheduler'):
                 self.scheduler.stop()
-            self.refresh_timer.stop()
+            # 断开 OPC 连接并等待完成
+            if self.opc_engine.connected:
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.run_until_complete(self.opc_engine.disconnect())
+                except Exception as e:
+                    global_logger.warning(f"Error during shutdown disconnect: {e}")
             event.accept()
             global_logger.info("Application shutdown by user.")
         else:

@@ -10,6 +10,7 @@ except ImportError:
 import uuid
 import asyncio
 from utils.logger import global_logger
+from utils.filter_helper import filter_nodes
 from ui.tabs.tab_monitor import MonitorTableModel
 
 class TabGroup(QWidget):
@@ -241,45 +242,18 @@ class TabGroup(QWidget):
         if not curr: return
         group_name = curr.text()
         
-        # 从本地配置拿组员 ID 清单
-        member_ids = self.dm.pm.get_groups().get(group_name, [])
+        # 转为 set 提升查找性能（O(1) vs O(n)）
+        member_ids = set(self.dm.pm.get_groups().get(group_name, []))
         all_nodes = self.dm.get_node_list()
         
         in_nodes = [n for n in all_nodes if n.get('node_id') in member_ids]
         
-        # 执行给out_node准备的过滤逻辑
-        tf_lower = getattr(self, 'cb_type', None) and self.cb_type.currentText().lower() or "全部类型"
-        kw = getattr(self, 'le_search', None) and self.le_search.text().strip().lower() or ""
-        type_map = {
-            "boolean": ["bool", "boolean"],
-            "uint": ["uint", "byte"], 
-            "int": ["int", "sbyte"],
-            "real": ["float", "double", "real"],
-            "string": ["string", "str", "localizedtext"]
-        }
-        allowed = type_map.get(tf_lower, [tf_lower])
+        # 使用公共筛选函数过滤可添加的节点
+        tf = getattr(self, 'cb_type', None) and self.cb_type.currentText() or "全部类型"
+        kw = getattr(self, 'le_search', None) and self.le_search.text().strip() or ""
         
-        out_nodes = []
-        for n in all_nodes:
-            if n.get('node_id') in member_ids: continue
-            
-            n_type = str(n.get('type', '')).lower()
-            if tf_lower != "全部类型":
-                matched = False
-                for t in allowed:
-                    if t in n_type:
-                        if tf_lower == 'int' and 'uint' in n_type:
-                            continue
-                        matched = True
-                        break
-                if not matched: continue
-                
-            if kw:
-                alias = str(n.get('alias', n.get('name', ''))).lower()
-                nid_str = str(n.get('node_id', '')).lower()
-                if kw not in alias and kw not in nid_str:
-                    continue
-            out_nodes.append(n)
+        non_member_nodes = [n for n in all_nodes if n.get('node_id') not in member_ids]
+        out_nodes = filter_nodes(non_member_nodes, keyword=kw, type_filter=tf)
         
         self.model_in.beginResetModel()
         self.model_in._data_cache = in_nodes
@@ -351,13 +325,24 @@ class TabGroup(QWidget):
         global_logger.info(f"==> 用户点击了批量 {action_name} 操作 | 受影响的分组: {', '.join(checked_groups)} | 受影响节点数: {len(combined_member_ids)}")
         
         def _task_err_callback(t):
-            exc = t.exception()
-            if exc:
-                global_logger.error(f"批量控制写入失败: {exc}")
+            if not t.cancelled():
+                exc = t.exception()
+                if exc:
+                    global_logger.error(f"批量控制写入失败: {exc}")
 
-        for nid in combined_member_ids:
-            task = asyncio.create_task(self.engine.write_node_value(nid, action_val))
-            task.add_done_callback(_task_err_callback)
+        # 分批发送写入指令，避免瞬间压垮 OPC 服务器
+        async def _batch_write():
+            member_list = list(combined_member_ids)
+            batch_size = 50
+            for i in range(0, len(member_list), batch_size):
+                batch = member_list[i:i+batch_size]
+                for nid in batch:
+                    task = asyncio.create_task(self.engine.write_node_value(nid, action_val))
+                    task.add_done_callback(_task_err_callback)
+                if i + batch_size < len(member_list):
+                    await asyncio.sleep(0.1)
+        
+        asyncio.create_task(_batch_write())
 
     def refresh_schedules(self):
         self.table_sched.setRowCount(0)
@@ -411,7 +396,7 @@ class TabGroup(QWidget):
         
         for g_name in checked_groups:
             sched_dict = {
-                "id": str(uuid.uuid4())[:8],
+                "id": str(uuid.uuid4()),
                 "group": g_name,
                 "time": time_str,
                 "action": is_on,

@@ -98,6 +98,8 @@ class OpcClientEngine:
         self.nodes = {}
         self.subscription = None
         self.connected = False
+        self.on_connection_lost = None  # 断线回调钩子
+        self._monitor_task = None
         
     async def connect(self):
         cert_file, key_file, hostname = generate_client_cert()
@@ -125,17 +127,51 @@ class OpcClientEngine:
         try:
             await self.client.connect()
             self.connected = True
+            # 启动后台心跳检测任务
+            self._start_monitor()
             return True
         except Exception as e:
             self.connected = False
             raise e
+
+    def _start_monitor(self):
+        """启动后台连接监视协程"""
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        self._monitor_task = asyncio.ensure_future(self._monitor_connection())
+
+    async def _monitor_connection(self):
+        """心跳检测：定期读取服务器状态节点，检测断线"""
+        while self.connected:
+            await asyncio.sleep(5)
+            if not self.connected:
+                break
+            try:
+                # 读取服务器状态节点（标准 OPC UA 节点）作为心跳
+                server_state = self.client.get_node("i=2259")
+                await server_state.read_value()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                global_logger.error(f"Connection monitor detected failure: {e}")
+                self.connected = False
+                if self.on_connection_lost and callable(self.on_connection_lost):
+                    try:
+                        self.on_connection_lost()
+                    except Exception as cb_err:
+                        global_logger.error(f"on_connection_lost callback error: {cb_err}")
+                break
             
     async def disconnect(self):
+        # 先停止心跳监视
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            self._monitor_task = None
+            
         try:
             if self.subscription and self.connected:
                 await self.subscription.delete()
         except Exception as e:
-            from utils.logger import global_logger
             global_logger.warning(f"Error deleting subscription: {e}")
         finally:
             self.subscription = None
@@ -144,7 +180,6 @@ class OpcClientEngine:
             if self.client and self.connected:
                 await self.client.disconnect()
         except Exception as e:
-            from utils.logger import global_logger
             global_logger.warning(f"Error disconnecting client: {e}")
         finally:
             self.connected = False
@@ -250,10 +285,16 @@ class OpcClientEngine:
                      value = str(value)
 
             data_value = ua.DataValue(ua.Variant(value, variant_type))
-            await node.write_value(data_value)
+            
+            # 添加了 asyncio.wait_for 5秒内超时以避免在网络被挂起时导致的整个协程假死不工作
+            await asyncio.wait_for(node.write_value(data_value), timeout=5.0)
+            
             global_logger.info(f"Successfully wrote {value} to node {node_id}")
             return True
             
+        except asyncio.TimeoutError:
+            global_logger.error(f"Timeout (5.0s) while writing to node {node_id}. The server might be unreachable or hanging.")
+            return False
         except Exception as e:
             global_logger.error(f"Failed to write to node {node_id}: {e}", exc_info=True)
             return False

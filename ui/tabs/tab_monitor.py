@@ -8,6 +8,7 @@ except ImportError:
     from PySide6.QtGui import QColor, QFont
 
 from utils.excel_parser import import_aliases_from_excel
+from utils.filter_helper import filter_nodes
 
 class MonitorTableModel(QAbstractTableModel):
     def __init__(self, data_manager):
@@ -22,46 +23,7 @@ class MonitorTableModel(QAbstractTableModel):
         self.beginResetModel()
         all_nodes = self.dm.get_node_list()
         
-        # 将下拉框中的名映射为 asyncua 的底层形式或相关的关键字
-        # 下拉包括 ["全部数据类型", "Boolean", "UInt", "Int", "Real", "String"]
-        tf_lower = type_filter.lower()
-        type_map = {
-            "boolean": ["bool", "boolean"],
-            "uint": ["uint", "byte"], # byte is also unsigned 
-            "int": ["int", "sbyte"],
-            "real": ["float", "double", "real"],
-            "string": ["string", "str", "localizedtext"]
-        }
-        allowed = type_map.get(tf_lower, [tf_lower])
-        
-        filtered = []
-        for n in all_nodes:
-            alias = str(n.get('alias', n.get('name', ''))).lower()
-            node_id = str(n.get('node_id', '')).lower()
-            n_type = str(n.get('type', '')).lower()
-            
-            # 类型筛检
-            if type_filter != "全部数据类型":
-                matched = False
-                for t in allowed:
-                    if t in n_type:
-                        # 规避 Int 被 UInt 误匹配的情况
-                        if tf_lower == 'int' and 'uint' in n_type:
-                            continue
-                        matched = True
-                        break
-                if not matched:
-                    continue
-                
-            # 关键词筛检
-            if keyword:
-                kw = keyword.lower()
-                if kw not in alias and kw not in node_id:
-                    continue
-                    
-            filtered.append(n)
-            
-        self._data_cache = filtered
+        self._data_cache = filter_nodes(all_nodes, keyword=keyword, type_filter=type_filter)
         self._row_map = {n.get('node_id'): i for i, n in enumerate(self._data_cache)}
         self._last_keyword = keyword
         self._last_type_filter = type_filter
