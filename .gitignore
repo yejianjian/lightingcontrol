@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+.pytest_cache/
+
+# PyInstaller
+#  通常这些文件由 PyInstaller 自动生成
+build/
+dist/
+*.spec
+
+# Logs
+logs/
+*.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+database/*.db
+server_cert_0.der
+server_key_0.pem
