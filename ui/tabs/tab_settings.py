@@ -136,7 +136,7 @@ class TabSettings(QWidget):
     async def _auto_reconnect_loop(self):
         try:
             while getattr(self, '_is_reconnecting', False) and not self.engine.connected:
-                await asyncio.sleep(5)
+                await asyncio.sleep(15) # 安全退避避免 SYN Flood 防火墙封禁
                 if self.engine.connected or not getattr(self, '_is_reconnecting', False):
                     break
                     
@@ -165,7 +165,7 @@ class TabSettings(QWidget):
                 except Exception as e:
                     global_logger.error(f"Auto-reconnect failed: {e}")
                     if getattr(self, '_is_reconnecting', False):
-                        self.btn_connect.setText("停止自动重连 (下次在5秒后...)")
+                        self.btn_connect.setText("停止自动重连 (下次在15秒后...)")
                         if hasattr(self.window(), 'lbl_dash_mode'):
                              self.window().lbl_dash_mode.setText("系统状态 (重连失败，定时重试中...)")
         finally:

@@ -106,6 +106,13 @@ class OpcClientEngine:
         self.client = Client(url=self.url)
         self.client.application_uri = "urn:example.org:FreeOpcUa:opcua-asyncio"
         
+        # [Phase 10] 修正 45 分钟断线规律问题
+        # 1. 调长安全通道寿命至 24 小时 (单位:ms)，规避 1 小时周期下 75% 时间点的续约失败
+        self.client.secure_channel_timeout = 86400000 
+        
+        # 2. 校正 Session 活跃超时时长，设为 30 分钟 (单位:ms)，增加弱网环境下的 Session 持久度
+        self.client.session_timeout = 1800000 
+        
         if self.username:
             self.client.set_user(self.username)
             self.client.set_password(self.password)
@@ -143,7 +150,7 @@ class OpcClientEngine:
     async def _monitor_connection(self):
         """心跳检测：定期读取服务器状态节点，检测断线"""
         while self.connected:
-            await asyncio.sleep(5)
+            await asyncio.sleep(20) # 原5秒，放宽至20秒以防狂刷日志
             if not self.connected:
                 break
             try:
@@ -201,6 +208,11 @@ class OpcClientEngine:
                         node_class = await child.read_node_class()
                         if node_class == ua.NodeClass.Variable:
                             node_idx = child.nodeid.to_string()
+                            
+                            # [Phase 11] 仅关注 namespace 为 2 (业务控制命名空间) 的节点，过滤掉如 ns=0系统节点 和不符合规范的节点
+                            if not node_idx.startswith("ns=2;"):
+                                continue
+
                             name = (await child.read_display_name()).Text
                             try:
                                 val_obj = await child.read_data_value()

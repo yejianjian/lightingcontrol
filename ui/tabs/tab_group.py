@@ -1,14 +1,15 @@
 try:
     from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem)
+                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog)
     from PyQt5.QtCore import Qt, QTime
 except ImportError:
     from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem)
+                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog)
     from PySide6.QtCore import Qt, QTime
     
 import uuid
 import asyncio
+import json
 from utils.logger import global_logger
 from utils.filter_helper import filter_nodes
 from ui.tabs.tab_monitor import MonitorTableModel
@@ -35,6 +36,12 @@ class TabGroup(QWidget):
         self.btn_rename_group = QPushButton("重命名")
         self.btn_del_group = QPushButton("删除分组")
         self.btn_del_group.setStyleSheet("QPushButton {background-color: #ff4d4f; color: white;} QPushButton:hover {background-color: #ff7875;} QPushButton:pressed {background-color: #d9363e;}")
+        
+        btn_layout_io = QHBoxLayout()
+        self.btn_export_group = QPushButton("导出配置")
+        self.btn_import_group = QPushButton("导入配置")
+        btn_layout_io.addWidget(self.btn_export_group)
+        btn_layout_io.addWidget(self.btn_import_group)
         
         btn_layout.addWidget(self.btn_add_group)
         btn_layout.addWidget(self.btn_rename_group)
@@ -63,6 +70,7 @@ class TabGroup(QWidget):
         batch_layout.addLayout(keys_layout)
         
         grp_group_layout.addLayout(btn_layout)
+        grp_group_layout.addLayout(btn_layout_io)
         grp_group_layout.addWidget(self.list_groups)
         grp_group_layout.addLayout(batch_layout)
         
@@ -174,6 +182,8 @@ class TabGroup(QWidget):
         self.btn_add_group.clicked.connect(self.on_add_group)
         self.btn_del_group.clicked.connect(self.on_del_group)
         self.btn_rename_group.clicked.connect(self.on_rename_group)
+        self.btn_export_group.clicked.connect(self.on_export_groups)
+        self.btn_import_group.clicked.connect(self.on_import_groups)
         self.list_groups.currentItemChanged.connect(self.on_group_selection_changed)
         
         self.btn_batch_on.clicked.connect(lambda: self.on_batch_control(True))
@@ -224,6 +234,63 @@ class TabGroup(QWidget):
                 self.refresh_groups_list()
             else:
                  QMessageBox.warning(self, "错误", "操作失败，可能目标名称已存在。")
+
+    def on_export_groups(self):
+        groups = self.dm.pm.get_groups()
+        if not groups:
+            QMessageBox.information(self, "提示", "目前没有任何分组可供导出。")
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出分组配置", "lighting_groups_export.json", "JSON Files (*.json)"
+        )
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(groups, f, indent=4, ensure_ascii=False)
+            QMessageBox.information(self, "导出成功", f"成功导出 {len(groups)} 个分组配置。")
+        except Exception as e:
+            QMessageBox.critical(self, "异常", f"导出失败: {e}")
+
+    def on_import_groups(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "导入分组配置", "", "JSON Files (*.json)"
+        )
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                import_data = json.load(f)
+                
+            if not isinstance(import_data, dict):
+                raise ValueError("JSON格式不合法（应为字典结构）。")
+                
+            current_groups = self.dm.pm.get_groups()
+            imported_count = 0
+            
+            for g_name, member_list in import_data.items():
+                if not isinstance(member_list, list):
+                    continue # 略过结构不严谨的项
+                
+                if g_name in current_groups:
+                    # 并集去重合并
+                    merged_members = list(set(current_groups[g_name] + member_list))
+                    current_groups[g_name] = merged_members
+                else:
+                    # 修复：直接赋值字典而不在循环内调用 add_group，防止 O(N) 次密集磁盘 save() I/O
+                    current_groups[g_name] = member_list
+                
+                imported_count += 1
+                
+            self.dm.pm.save()
+            self.refresh_groups_list()
+            QMessageBox.information(self, "导入成功", f"成功从配置文件合并了 {imported_count} 个分组逻辑。")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", f"配置文件读取或合并出错: {e}")
+                 
                  
     def on_group_selection_changed(self, current, previous):
         if not current: 
