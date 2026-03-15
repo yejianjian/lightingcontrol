@@ -1,15 +1,14 @@
 try:
     from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox)
+                                 QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox, QTreeWidget, QTreeWidgetItem)
     from PyQt5.QtCore import Qt, QTime
 except ImportError:
     from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox)
+                                 QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox, QTreeWidget, QTreeWidgetItem)
     from PySide6.QtCore import Qt, QTime
     
 import uuid
 import asyncio
-import json
 import re
 import pandas as pd
 from utils.logger import global_logger
@@ -34,7 +33,8 @@ class TabGroup(QWidget):
         grp_group_layout = QVBoxLayout(grp_group)
         
         btn_layout = QHBoxLayout()
-        self.btn_add_group = QPushButton("新建分组")
+        self.btn_add_group = QPushButton("新建一级分组")
+        self.btn_add_sub = QPushButton("新建子分组")
         self.btn_rename_group = QPushButton("重命名")
         self.btn_del_group = QPushButton("删除分组")
         self.btn_del_group.setStyleSheet("QPushButton {background-color: #ff4d4f; color: white;} QPushButton:hover {background-color: #ff7875;} QPushButton:pressed {background-color: #d9363e;}")
@@ -46,10 +46,12 @@ class TabGroup(QWidget):
         btn_layout_io.addWidget(self.btn_import_group)
         
         btn_layout.addWidget(self.btn_add_group)
+        btn_layout.addWidget(self.btn_add_sub)
         btn_layout.addWidget(self.btn_rename_group)
         btn_layout.addWidget(self.btn_del_group)
         
-        self.list_groups = QListWidget()
+        self.tree_groups = QTreeWidget()
+        self.tree_groups.setHeaderLabel("照明分组架构 (三级)")
         
         # 批量控制区（底部）
         batch_layout = QVBoxLayout()
@@ -73,7 +75,7 @@ class TabGroup(QWidget):
         
         grp_group_layout.addLayout(btn_layout)
         grp_group_layout.addLayout(btn_layout_io)
-        grp_group_layout.addWidget(self.list_groups)
+        grp_group_layout.addWidget(self.tree_groups)
         grp_group_layout.addLayout(batch_layout)
         
         left_layout.addWidget(grp_group)
@@ -195,12 +197,13 @@ class TabGroup(QWidget):
         self.tb_out.doubleClicked.connect(self.on_move_in)
         
         # 绑定左侧群组信号
-        self.btn_add_group.clicked.connect(self.on_add_group)
+        self.btn_add_group.clicked.connect(lambda: self.on_add_group(is_sub=False))
+        self.btn_add_sub.clicked.connect(lambda: self.on_add_group(is_sub=True))
         self.btn_del_group.clicked.connect(self.on_del_group)
         self.btn_rename_group.clicked.connect(self.on_rename_group)
         self.btn_export_group.clicked.connect(self.on_export_groups)
         self.btn_import_group.clicked.connect(self.on_import_groups)
-        self.list_groups.currentItemChanged.connect(self.on_group_selection_changed)
+        self.tree_groups.currentItemChanged.connect(self.on_group_selection_changed)
         
         self.btn_batch_on.clicked.connect(lambda: self.on_batch_control(True))
         self.btn_batch_off.clicked.connect(lambda: self.on_batch_control(False))
@@ -212,44 +215,110 @@ class TabGroup(QWidget):
         self.refresh_schedules()
 
     def refresh_groups_list(self):
-        self.list_groups.clear()
-        groups = self.dm.pm.get_groups()
-        for g_name in groups.keys():
-            item = QListWidgetItem(g_name)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
-            self.list_groups.addItem(item)
+        """重新构建树形分组结构"""
+        selected_id = None
+        curr = self.tree_groups.currentItem()
+        if curr:
+            selected_id = curr.data(0, Qt.UserRole)
             
-    def on_add_group(self):
-        text, ok = QInputDialog.getText(self, "新建分组", "请输入分组名称:")
+        self.tree_groups.clear()
+        groups = self.dm.pm.get_groups()
+        
+        # 构建 ID 到 item 的映射
+        items_map = {}
+        
+        # 第一轮：创建所有顶级节点
+        for g in groups:
+            if g.get("parent_id") is None:
+                item = QTreeWidgetItem(self.tree_groups)
+                item.setText(0, g["name"])
+                item.setData(0, Qt.UserRole, g["id"])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.Unchecked)
+                items_map[g["id"]] = item
+        
+        # 多轮尝试（支持嵌套，虽然逻辑限制了三级）
+        for _ in range(5):
+            added_any = False
+            for g in groups:
+                if g["id"] in items_map: continue
+                pid = g.get("parent_id")
+                if pid in items_map:
+                    parent_item = items_map[pid]
+                    item = QTreeWidgetItem(parent_item)
+                    item.setText(0, g["name"])
+                    item.setData(0, Qt.UserRole, g["id"])
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                    item.setCheckState(0, Qt.Unchecked)
+                    items_map[g["id"]] = item
+                    added_any = True
+            if not added_any: break
+            
+        self.tree_groups.expandAll()
+        
+        # 恢复选中
+        if selected_id:
+            for i in range(self.tree_groups.topLevelItemCount()):
+                item = self.tree_groups.topLevelItem(i)
+                if self._find_and_select_item(item, selected_id):
+                    break
+
+    def _find_and_select_item(self, item, target_id):
+        if item.data(0, Qt.UserRole) == target_id:
+            self.tree_groups.setCurrentItem(item)
+            return True
+        for i in range(item.childCount()):
+            if self._find_and_select_item(item.child(i), target_id):
+                return True
+        return False
+            
+    def on_add_group(self, is_sub=False):
+        parent_id = None
+        current_depth = 0
+        
+        if is_sub:
+            curr = self.tree_groups.currentItem()
+            if not curr:
+                QMessageBox.warning(self, "提示", "请先选中一个父分组。")
+                return
+            parent_id = curr.data(0, Qt.UserRole)
+            # 计算深度
+            temp = curr
+            while temp:
+                current_depth += 1
+                temp = temp.parent()
+            
+            if current_depth >= 3:
+                QMessageBox.warning(self, "深度限制", "分组深度最高支持 3 级（例如：区域 > 楼层 > 房间）。")
+                return
+        
+        title = "新建子分组" if is_sub else "新建一级分组"
+        text, ok = QInputDialog.getText(self, title, "请输入分组名称:")
         if ok and text.strip():
-            if self.dm.pm.add_group(text.strip()):
-                self.refresh_groups_list()
-            else:
-                QMessageBox.warning(self, "错误", "分组名称已存在或非法。")
+            self.dm.pm.add_group(text.strip(), parent_id)
+            self.refresh_groups_list()
                 
     def on_del_group(self):
-        curr = self.list_groups.currentItem()
+        curr = self.tree_groups.currentItem()
         if not curr: return
-        name = curr.text()
+        group_id = curr.data(0, Qt.UserRole)
+        name = curr.text(0)
         
-        rep = QMessageBox.question(self, "确认", f"确定要删除分组 {name} 吗？\n(仅解散分组，不影响控制节点)", QMessageBox.Yes | QMessageBox.No)
+        rep = QMessageBox.question(self, "确认", f"确定要删除分组 {name} 及其所有子分组吗？\n(仅解散分组，不影响控制节点)", QMessageBox.Yes | QMessageBox.No)
         if rep == QMessageBox.Yes:
-            self.dm.pm.delete_group(name)
+            self.dm.pm.delete_group(group_id)
             self.refresh_groups_list()
-            # 清空右侧选定状态TODO
 
     def on_rename_group(self):
-        curr = self.list_groups.currentItem()
+        curr = self.tree_groups.currentItem()
         if not curr: return
-        old_name = curr.text()
+        group_id = curr.data(0, Qt.UserRole)
+        old_name = curr.text(0)
         
         text, ok = QInputDialog.getText(self, "重命名", "请输入新分组名称:", text=old_name)
         if ok and text.strip() and text.strip() != old_name:
-            if self.dm.pm.rename_group(old_name, text.strip()):
+            if self.dm.pm.rename_group(group_id, text.strip()):
                 self.refresh_groups_list()
-            else:
-                 QMessageBox.warning(self, "错误", "操作失败，可能目标名称已存在。")
 
     def on_export_groups(self):
         groups = self.dm.pm.get_groups()
@@ -265,9 +334,10 @@ class TabGroup(QWidget):
             
         try:
             export_rows = []
-            for g_name, member_ids in groups.items():
-                for full_id in member_ids:
-                    # 提取标识符部分 (支持 i=, s=, g=, b=)
+            for g in groups:
+                g_name = g["name"]
+                for full_id in g.get("nodes", []):
+                    # [V1.2.0 修订] 仅导出标识符的具体值内容，不含 ns=2;s= 前缀
                     match = re.search(r'[isgb]=(.+)', full_id)
                     short_id = match.group(1) if match else full_id
                     export_rows.append({
@@ -310,33 +380,36 @@ class TabGroup(QWidget):
                 else:
                     id_map[full_id] = full_id # 兜底逻辑
 
-            current_groups = self.dm.pm.get_groups()
             imported_data = {} # group -> [full_ids]
-            
             for _, row in df.iterrows():
                 g_name = str(row["分组名称"]).strip()
                 raw_id = str(row["节点标识"]).strip()
-                
-                if not g_name or not raw_id:
-                    continue
-                
-                # 兼容 Excel 将数字 ID 读取为 '1001.0' 的情况
-                clean_id = raw_id.split('.')[0] if '.' in raw_id and raw_id.split('.')[1] == '0' else raw_id
-                
+                if not g_name or not raw_id: continue
+                clean_id = raw_id[:-2] if raw_id.endswith('.0') else raw_id
                 full_id = id_map.get(clean_id) or id_map.get(raw_id)
                 if full_id:
                     if g_name not in imported_data:
                         imported_data[g_name] = []
                     imported_data[g_name].append(full_id)
-            
+
+            current_groups = self.dm.pm.get_groups() # 这是一个列表了
             imported_count = 0
+            
+            # 由于目前导入暂不处理树形层级（全部作为一级处理），为了向后兼容
             for g_name, member_list in imported_data.items():
-                if g_name in current_groups:
+                target_g = None
+                for g in current_groups:
+                    if g["name"] == g_name:
+                        target_g = g
+                        break
+                        
+                if target_g:
                     # 并集去重合并
-                    merged_members = list(set(current_groups[g_name] + member_list))
-                    current_groups[g_name] = merged_members
+                    merged_members = list(set(target_g.get("nodes", []) + member_list))
+                    self.dm.pm.update_group_members(target_g["id"], merged_members)
                 else:
-                    current_groups[g_name] = member_list
+                    new_id = self.dm.pm.add_group(g_name)
+                    self.dm.pm.update_group_members(new_id, member_list)
                 imported_count += 1
                 
             self.dm.pm.save()
@@ -360,19 +433,22 @@ class TabGroup(QWidget):
         self.refresh_members()
         
     def refresh_members(self):
-        curr = self.list_groups.currentItem()
+        curr = self.tree_groups.currentItem()
         if not curr: return
-        group_name = curr.text()
+        group_id = curr.data(0, Qt.UserRole)
         
-        # 转为 set 提升查找性能（O(1) vs O(n)）
-        member_ids = set(self.dm.pm.get_groups().get(group_name, []))
+        group_obj = self.dm.pm.get_group_by_id(group_id)
+        if not group_obj: return
+        
+        # 成员穿梭框仅针对「当前特定层级」的分组，不包含子孙
+        member_ids = set(group_obj.get("nodes", []))
         all_nodes = self.dm.get_node_list()
         
         in_nodes = [n for n in all_nodes if n.get('node_id') in member_ids]
         
         # 使用公共筛选函数过滤可添加的节点
-        tf = getattr(self, 'cb_type', None) and self.cb_type.currentText() or "全部类型"
-        kw = getattr(self, 'le_search', None) and self.le_search.text().strip() or ""
+        tf = self.cb_type.currentText()
+        kw = self.le_search.text().strip()
         
         non_member_nodes = [n for n in all_nodes if n.get('node_id') not in member_ids]
         out_nodes = filter_nodes(non_member_nodes, keyword=kw, type_filter=tf)
@@ -386,45 +462,63 @@ class TabGroup(QWidget):
         self.model_out.endResetModel()
 
     def on_move_in(self, index):
-        curr = self.list_groups.currentItem()
+        curr = self.tree_groups.currentItem()
         if not curr or not index.isValid(): return
-        group_name = curr.text()
+        group_id = curr.data(0, Qt.UserRole)
         
-        node = self.model_out._data_cache[index.row()]
+        try:
+            node = self.model_out._data_cache[index.row()]
+        except IndexError:
+            return
         nid = node.get('node_id')
         
-        members = self.dm.pm.get_groups().get(group_name, [])
-        if nid not in members:
-            members.append(nid)
-            self.dm.pm.update_group_members(group_name, members)
-            self.refresh_members()
+        group_obj = self.dm.pm.get_group_by_id(group_id)
+        if group_obj:
+            members = group_obj.get("nodes", [])
+            if nid not in members:
+                members.append(nid)
+                self.dm.pm.update_group_members(group_id, members)
+                self.refresh_members()
 
     def on_move_out(self, index):
-        curr = self.list_groups.currentItem()
+        curr = self.tree_groups.currentItem()
         if not curr or not index.isValid(): return
-        group_name = curr.text()
+        group_id = curr.data(0, Qt.UserRole)
         
-        node = self.model_in._data_cache[index.row()]
+        try:
+            node = self.model_in._data_cache[index.row()]
+        except IndexError:
+            return
         nid = node.get('node_id')
         
-        members = self.dm.pm.get_groups().get(group_name, [])
-        if nid in members:
-            members.remove(nid)
-            self.dm.pm.update_group_members(group_name, members)
-            self.refresh_members()
+        group_obj = self.dm.pm.get_group_by_id(group_id)
+        if group_obj:
+            members = group_obj.get("nodes", [])
+            if nid in members:
+                members.remove(nid)
+                self.dm.pm.update_group_members(group_id, members)
+                self.refresh_members()
+
+    def _get_checked_group_ids(self):
+        ids = []
+        def collect_checked(item):
+            if item.checkState(0) == Qt.Checked:
+                ids.append(item.data(0, Qt.UserRole))
+            for i in range(item.childCount()):
+                collect_checked(item.child(i))
+        
+        for i in range(self.tree_groups.topLevelItemCount()):
+            collect_checked(self.tree_groups.topLevelItem(i))
+        return ids
 
     def on_batch_control(self, action_val: bool):
-        checked_groups = []
-        for i in range(self.list_groups.count()):
-            item = self.list_groups.item(i)
-            if item.checkState() == Qt.Checked:
-                checked_groups.append(item.text())
+        checked_group_ids = self._get_checked_group_ids()
                 
-        if not checked_groups:
+        if not checked_group_ids:
             # 向下兼容：如果没勾选，但选中了一行，也放行
-            curr = self.list_groups.currentItem()
+            curr = self.tree_groups.currentItem()
             if curr:
-                checked_groups.append(curr.text())
+                checked_group_ids.append(curr.data(0, Qt.UserRole))
             else:
                 QMessageBox.warning(self, "未勾选组", "请先在左侧通过复选框勾选要控的分组。")
                 return
@@ -434,17 +528,22 @@ class TabGroup(QWidget):
             return
             
         combined_member_ids = set()
-        for group_name in checked_groups:
-            members = self.dm.pm.get_groups().get(group_name, [])
+        display_names = []
+        for group_id in checked_group_ids:
+            # 递归获取成员
+            members = self.dm.pm.get_group_nodes_recursive(group_id)
             combined_member_ids.update(members)
+            
+            g_obj = self.dm.pm.get_group_by_id(group_id)
+            if g_obj: display_names.append(g_obj["name"])
         
         if not combined_member_ids:
-            QMessageBox.information(self, "空组", "当前指定的分组内没有任何控制点。")
+            QMessageBox.information(self, "空组", "当前指定的分组（及其子组）内没有任何控制点。")
             return
             
         # 并发发送写入指令前作好全量日志记录
         action_name = '全开' if action_val else '全关'
-        global_logger.info(f"==> 用户点击了批量 {action_name} 操作 | 受影响的分组: {', '.join(checked_groups)} | 受影响节点数: {len(combined_member_ids)}")
+        global_logger.info(f"==> 用户点击了批量 {action_name} 操作 | 受影响的分组: {', '.join(display_names)} | 受影响总节点数: {len(combined_member_ids)}")
         
         def _task_err_callback(t):
             if not t.cancelled():
@@ -459,7 +558,9 @@ class TabGroup(QWidget):
             for i in range(0, len(member_list), batch_size):
                 batch = member_list[i:i+batch_size]
                 for nid in batch:
-                    task = asyncio.create_task(self.engine.write_node_value(nid, action_val))
+                    # 获取别名用于日志显示
+                    alias = self.dm.get_alias_by_node_id(nid)
+                    task = asyncio.create_task(self.engine.write_node_value(nid, action_val, display_name=alias))
                     task.add_done_callback(_task_err_callback)
                 if i + batch_size < len(member_list):
                     await asyncio.sleep(0.1)
@@ -474,7 +575,13 @@ class TabGroup(QWidget):
             self.table_sched.insertRow(row)
             
             self.table_sched.setItem(row, 0, QTableWidgetItem(s.get("id", "")))
-            self.table_sched.setItem(row, 1, QTableWidgetItem(s.get("group", "")))
+            
+            # 查找分组名称
+            g_id = s.get("group_id")
+            g_obj = self.dm.pm.get_group_by_id(g_id)
+            g_name = g_obj.get("name") if g_obj else f"未知分组({g_id})"
+            
+            self.table_sched.setItem(row, 1, QTableWidgetItem(g_name))
             self.table_sched.setItem(row, 2, QTableWidgetItem(s.get("time", "")))
             
             # 显示日期
@@ -513,16 +620,12 @@ class TabGroup(QWidget):
         self.refresh_schedules()
 
     def on_add_schedule(self):
-        checked_groups = []
-        for i in range(self.list_groups.count()):
-            item = self.list_groups.item(i)
-            if item.checkState() == Qt.Checked:
-                checked_groups.append(item.text())
+        checked_group_ids = self._get_checked_group_ids()
         
-        if not checked_groups:
-            curr = self.list_groups.currentItem()
+        if not checked_group_ids:
+            curr = self.tree_groups.currentItem()
             if curr:
-                checked_groups.append(curr.text())
+                checked_group_ids.append(curr.data(0, Qt.UserRole))
             else:
                 QMessageBox.warning(self, "提示", "请在左侧至少勾选一个分组，时间计划必须挂靠在分组上。")
                 return
@@ -536,16 +639,20 @@ class TabGroup(QWidget):
             if cb.isChecked():
                 weekdays.append(i)
         
-        for g_name in checked_groups:
+        sched_list = []
+        for g_id in checked_group_ids:
             sched_dict = {
                 "id": str(uuid.uuid4()),
-                "group": g_name,
+                "group_id": g_id,
                 "time": time_str,
                 "weekdays": weekdays,
                 "action": is_on,
                 "enabled": True
             }
-            self.dm.pm.add_schedule(sched_dict)
+            sched_list.append(sched_dict)
+        
+        # 批量添加，一次性持久化，避免 N 次磁盘 IO
+        self.dm.pm.batch_add_schedules(sched_list)
             
         self.refresh_schedules()
 

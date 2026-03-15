@@ -203,7 +203,7 @@ class TabMonitor(QWidget):
             rows = []
             for n in all_nodes:
                 full_id = n.get('node_id', '')
-                # 提取标识符部分 (支持 i=, s=, g=, b=)
+                # [V1.2.0 修订] 仅导出标识符的具体值内容，不含 ns=2;s= 前缀
                 match = re.search(r'[isgb]=(.+)', full_id)
                 short_id = match.group(1) if match else full_id
                 

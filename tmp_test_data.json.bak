@@ -1,0 +1,81 @@
+{
+  "aliases": {},
+  "groups": [
+    {
+      "id": "90307e5c-5c9e-4d6c-b6ae-5796bb860244",
+      "name": "Office Area",
+      "parent_id": null,
+      "nodes": [
+        "node_area_1"
+      ]
+    },
+    {
+      "id": "902f6a5f-ddab-4b1b-8c33-960ff1caf519",
+      "name": "1st Floor",
+      "parent_id": "90307e5c-5c9e-4d6c-b6ae-5796bb860244",
+      "nodes": [
+        "node_floor_1",
+        "node_floor_2"
+      ]
+    },
+    {
+      "id": "8bf2dbc0-3673-44e0-bd55-a02bc2fcdd8f",
+      "name": "Room 101",
+      "parent_id": "902f6a5f-ddab-4b1b-8c33-960ff1caf519",
+      "nodes": [
+        "node_room_1"
+      ]
+    },
+    {
+      "id": "ccf0303e-1030-4cf5-a229-1bef80b8968a",
+      "name": "Office Area",
+      "parent_id": null,
+      "nodes": [
+        "node_area_1"
+      ]
+    },
+    {
+      "id": "db6c6c4f-5c00-425d-a338-f8b3e2e6a7b6",
+      "name": "1st Floor",
+      "parent_id": "ccf0303e-1030-4cf5-a229-1bef80b8968a",
+      "nodes": [
+        "node_floor_1",
+        "node_floor_2"
+      ]
+    },
+    {
+      "id": "10d3c370-c890-4372-b1a3-5cc883975abb",
+      "name": "Room 101",
+      "parent_id": "db6c6c4f-5c00-425d-a338-f8b3e2e6a7b6",
+      "nodes": [
+        "node_room_1"
+      ]
+    },
+    {
+      "id": "2a243d43-81ad-40cc-94a5-5fbc8dc4a33e",
+      "name": "Office Area",
+      "parent_id": null,
+      "nodes": [
+        "node_area_1"
+      ]
+    },
+    {
+      "id": "24b3fd32-ba6d-45e8-8f2f-1dc9dc0f24ca",
+      "name": "1st Floor",
+      "parent_id": "2a243d43-81ad-40cc-94a5-5fbc8dc4a33e",
+      "nodes": [
+        "node_floor_1",
+        "node_floor_2"
+      ]
+    },
+    {
+      "id": "960d7af6-669c-49c9-9068-84ee13f50125",
+      "name": "Room 101",
+      "parent_id": "24b3fd32-ba6d-45e8-8f2f-1dc9dc0f24ca",
+      "nodes": [
+        "node_room_1"
+      ]
+    }
+  ],
+  "schedules": []
+}

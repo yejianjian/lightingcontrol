@@ -1,7 +1,9 @@
 try:
     from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QMessageBox, QGroupBox
+    from PyQt5.QtCore import QTimer
 except ImportError:
     from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QFormLayout, QMessageBox, QGroupBox
+    from PySide6.QtCore import QTimer
 
 import asyncio
 from utils.logger import global_logger
@@ -26,11 +28,14 @@ class TabSettings(QWidget):
         self.le_user = QLineEdit("admin")
         self.le_pass = QLineEdit("123456")
         self.le_pass.setEchoMode(QLineEdit.Password)
+        self.le_ns_filter = QLineEdit("ns=2;")
+        self.le_ns_filter.setToolTip("业务节点命名空间前缀，留空则不过滤")
 
         form_conn.addRow("DA 主机 IP (Host):", self.le_host)
         form_conn.addRow("服务端口 (Port):", self.le_port)
         form_conn.addRow("验证账户 (User):", self.le_user)
         form_conn.addRow("验证密码 (Password):", self.le_pass)
+        form_conn.addRow("节点命名空间前缀:", self.le_ns_filter)
 
         # 按钮容器
         btn_layout = QHBoxLayout()
@@ -69,6 +74,9 @@ class TabSettings(QWidget):
             self.engine.url = f"opc.tcp://{self.engine.host}:{self.engine.port}/"
             self.engine.username = self.le_user.text().strip()
             self.engine.password = self.le_pass.text().strip()
+            # 传入可配置的命名空间过滤前缀
+            ns_filter = self.le_ns_filter.text().strip()
+            self.engine.namespace_filter = ns_filter if ns_filter else None
             
             self.btn_connect.setEnabled(False)
             self.btn_connect.setText("正在连接中...")
@@ -116,19 +124,24 @@ class TabSettings(QWidget):
             self.btn_connect.setEnabled(True)
 
     def _on_sub_data(self, node_id, value, timestamp):
-        # 接收到底层推送，交给DataManager中心处理合并 (顺带触发UI统计渲染)
+        # 接收到底层推送，交给DataManager中心处理合并
+        # DataManager.update_node 已内置未知节点校验，此处无需额外检查
         self.dm.update_node(node_id, {"value": value, "timestamp": timestamp})
 
     def _handle_connection_lost(self):
         global_logger.warning("UI caught connection lost event. Initiating auto-reconnect sequence.")
         
-        if hasattr(self.window(), 'lbl_dash_mode'):
-            self.window().lbl_dash_mode.setText("系统状态 (连接断开，尝试重连中...)")
-            self.window().lbl_dash_mode.setStyleSheet("background-color: #ffccc7; color: #cf1322; border: 1px solid #ffa39e; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
-            
-        self.btn_connect.setEnabled(True)
-        self.btn_connect.setText("停止自动重连")
-        self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+        # 使用 QTimer.singleShot(0, ...) 确保 UI 操作始终在主线程执行
+        def _update_ui():
+            if hasattr(self.window(), 'lbl_dash_mode'):
+                self.window().lbl_dash_mode.setText("系统状态 (连接断开，尝试重连中...)")
+                self.window().lbl_dash_mode.setStyleSheet("background-color: #ffccc7; color: #cf1322; border: 1px solid #ffa39e; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+                
+            self.btn_connect.setEnabled(True)
+            self.btn_connect.setText("停止自动重连")
+            self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+        
+        QTimer.singleShot(0, _update_ui)
         self._is_reconnecting = True
         
         asyncio.create_task(self._auto_reconnect_loop())

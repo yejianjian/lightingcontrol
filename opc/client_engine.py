@@ -88,12 +88,13 @@ def generate_client_cert(cert_file="client_cert.der", key_file="client_key.pem")
     return cert_file, key_file, hostname
 
 class OpcClientEngine:
-    def __init__(self, host="localhost", port=48401, username="", password=""):
+    def __init__(self, host="localhost", port=48401, username="", password="", namespace_filter="ns=2;"):
         self.host = host
         self.port = port
         self.url = f"opc.tcp://{host}:{port}/"
         self.username = username
         self.password = password
+        self.namespace_filter = namespace_filter  # 业务节点命名空间前缀，可配置
         self.client = None
         self.nodes = {}
         self.subscription = None
@@ -226,8 +227,8 @@ class OpcClientEngine:
                         if node_class == ua.NodeClass.Variable:
                             node_idx = child.nodeid.to_string()
                             
-                            # [Phase 11] 仅关注 namespace 为 2 (业务控制命名空间) 的节点，过滤掉如 ns=0系统节点 和不符合规范的节点
-                            if not node_idx.startswith("ns=2;"):
+                            # 仅关注业务控制命名空间的节点，过滤系统节点
+                            if self.namespace_filter and not node_idx.startswith(self.namespace_filter):
                                 continue
 
                             name = (await child.read_display_name()).Text
@@ -255,9 +256,9 @@ class OpcClientEngine:
                         elif node_class == ua.NodeClass.Object:
                             await browse_recursive(child, max_depth - 1)
                     except Exception as child_err:
-                        print(f"Error reading child {child}: {child_err}")
+                        global_logger.warning(f"Error reading child {child}: {child_err}")
             except Exception as e:
-                print(f"Error browsing node {node}: {e}")
+                global_logger.warning(f"Error browsing node {node}: {e}")
         
         await browse_recursive(objects_node)
         self.nodes = {n['node_id']: n for n in discovered_nodes}
@@ -282,7 +283,7 @@ class OpcClientEngine:
         except Exception as e:
             global_logger.error(f"Failed to create start_subscription: {e}", exc_info=True)
 
-    async def write_node_value(self, node_id, value):
+    async def write_node_value(self, node_id, value, display_name=None):
         """
         向 OPC 服务器下发控制指令
         """
@@ -290,15 +291,18 @@ class OpcClientEngine:
             global_logger.warning("Attempted to write while not connected.")
             return False
             
+        target_display = display_name if display_name else node_id
         try:
             node = self.client.get_node(node_id)
             
             # 自动推断写入 Variant 类型（根据当前工程大部分为布尔量）
             variant_type = ua.VariantType.Boolean
+            # 注意: Python 中 bool 是 int 的子类，bool 检查必须在 int 之前，
+            # 否则 True/False 会被 isinstance(value, int) 捕获导致类型错判
             if isinstance(value, bool):
                 variant_type = ua.VariantType.Boolean
             elif isinstance(value, int):
-                variant_type = ua.VariantType.Int16 # 假定通用整形，具体可以根据 node 数据类型再细化
+                variant_type = ua.VariantType.Int16
             elif isinstance(value, float):
                 variant_type = ua.VariantType.Float
                 
@@ -323,12 +327,12 @@ class OpcClientEngine:
             # 添加了 asyncio.wait_for 5秒内超时以避免在网络被挂起时导致的整个协程假死不工作
             await asyncio.wait_for(node.write_value(data_value), timeout=5.0)
             
-            global_logger.info(f"Successfully wrote {value} to node {node_id}")
+            global_logger.info(f"Successfully wrote {value} to node {target_display}")
             return True
             
         except asyncio.TimeoutError:
-            global_logger.error(f"Timeout (5.0s) while writing to node {node_id}. The server might be unreachable or hanging.")
+            global_logger.error(f"Timeout (5.0s) while writing to node {target_display}. The server might be unreachable or hanging.")
             return False
         except Exception as e:
-            global_logger.error(f"Failed to write to node {node_id}: {e}", exc_info=True)
+            global_logger.error(f"Failed to write to node {target_display}: {e}", exc_info=True)
             return False

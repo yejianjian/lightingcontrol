@@ -28,7 +28,7 @@ from core.group_scheduler import GroupScheduler
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("灯光自动控制系统 V1.1.0")
+        self.setWindowTitle("灯光自动控制系统 V1.2.0beta")
         # 宽屏比例适配
         self.resize(1100, 750)
         
@@ -189,20 +189,21 @@ class MainWindow(QMainWindow):
             # 停止调度器
             if hasattr(self, 'scheduler'):
                 self.scheduler.stop()
-            # 断开 OPC 连接并等待完成
+            # 断开 OPC 连接 — 使用 ensure_future 避免 run_until_complete 死锁
             if self.opc_engine.connected:
                 try:
-                    loop = asyncio.get_event_loop()
-                    loop.run_until_complete(self.opc_engine.disconnect())
+                    asyncio.ensure_future(self.opc_engine.disconnect())
                 except Exception as e:
                     global_logger.warning(f"Error during shutdown disconnect: {e}")
             
-            # 停止事件循环，让 main.py 中的 loop.run_forever() 退出
-            try:
-                loop = asyncio.get_event_loop()
-                loop.stop()
-            except Exception:
-                pass
+            # 延时停止事件循环，让断连协程有时间被调度执行
+            def _deferred_stop():
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.stop()
+                except Exception:
+                    pass
+            QTimer.singleShot(1000, _deferred_stop)
 
             event.accept()
             global_logger.info("Application shutdown by user.")

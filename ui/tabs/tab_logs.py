@@ -1,34 +1,35 @@
 try:
     from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPlainTextEdit, QPushButton, QHBoxLayout
-    from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+    from PyQt5.QtCore import QObject, pyqtSignal
 except ImportError:
     from PySide6.QtWidgets import QWidget, QVBoxLayout, QPlainTextEdit, QPushButton, QHBoxLayout
-    from PySide6.QtCore import QMetaObject, Qt
+    from PySide6.QtCore import QObject, Signal as pyqtSignal
 
 import logging
 from utils.logger import global_logger
 
+
+class _LogBridge(QObject):
+    """信号桥：将跨线程的日志消息安全地转发到 Qt 主线程"""
+    log_message = pyqtSignal(str)
+
+
 class UILogHandler(logging.Handler):
     """
-    一个日志拦截句柄，将原本打在控制台和文件里的日志分流输送到指定的UI文本框
+    一个日志拦截句柄，将原本打在控制台和文件里的日志分流输送到指定的UI文本框。
+    使用信号槽机制确保线程安全（兼容 PyQt5 和 PySide6）。
     """
     def __init__(self, widget):
         super().__init__()
-        self.widget = widget
+        self._bridge = _LogBridge()
+        self._bridge.log_message.connect(widget.appendPlainText)
 
     def emit(self, record):
-        msg = self.format(record)
-        # 线程安全：通过 invokeMethod 排队到主线程执行
         try:
-            QMetaObject.invokeMethod(
-                self.widget, "appendPlainText", Qt.QueuedConnection, Q_ARG(str, msg)
-            )
-        except (TypeError, RuntimeError):
-            # PySide6 的 invokeMethod 签名不同，回退到直接调用
-            try:
-                self.widget.appendPlainText(msg)
-            except RuntimeError:
-                pass  # widget 已销毁
+            msg = self.format(record)
+            self._bridge.log_message.emit(msg)
+        except RuntimeError:
+            pass  # widget 已销毁
 
 
 class TabLogs(QWidget):

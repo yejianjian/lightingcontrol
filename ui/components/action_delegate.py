@@ -115,7 +115,9 @@ class ActionButtonDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
         
     def _dispatch_write(self, node_id, target_val, action_name):
-        global_logger.info(f"==== UI单点操作触发 ==== -> [节点ID: {node_id}] | 指令发送: 【{action_name}】")
+        # 获取别名用于日志显示
+        alias = self.dm.get_alias_by_node_id(node_id)
+        global_logger.info(f"==== UI单点操作触发 ==== -> [点位: {alias}] | 指令发送: 【{action_name}】")
         
         if not self.opc_engine.connected:
             QMessageBox.warning(self.parent(), "错误", "目前未连接到 OPC UA 服务器。")

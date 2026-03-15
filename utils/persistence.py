@@ -1,16 +1,27 @@
 import json
 import os
+import sys
+import uuid
 from utils.logger import global_logger
+
+def _get_base_dir():
+    """获取应用基础目录：打包后为可执行文件所在目录，开发时为项目根目录"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class PersistenceManager:
     """
     负责本地持久化点位的别名、数据分组和调度方案
     """
     def __init__(self, data_file="data/lighting_config.json"):
+        # 将相对路径转为基于应用目录的绝对路径，避免工作目录不一致问题
+        if not os.path.isabs(data_file):
+            data_file = os.path.join(_get_base_dir(), data_file)
         self.data_file = data_file
         self.data_store = {
             "aliases": {},  # node_id: "自定义名称"
-            "groups": {},   # group_name: ["node_id1", "node_id2"]
+            "groups": [],   # 升级为列表结构: [{"id": "uuid", "name": "...", "parent_id": None, "nodes": [...]}, ...]
             "schedules": [] # 结构化的定时任务清单
         }
         self.load()
@@ -28,6 +39,37 @@ class PersistenceManager:
                         if key not in data:
                             data[key] = self.data_store[key]
                     self.data_store.update(data)
+                    
+                    # --- 数据迁移逻辑 (由平级字典迁移至树形列表) ---
+                    if isinstance(self.data_store["groups"], dict):
+                        global_logger.info("Migrating legacy flat group dictionary to hierarchical list...")
+                        old_groups = self.data_store["groups"]
+                        new_groups = []
+                        name_to_id_map = {}
+                        
+                        # 转换分组
+                        for g_name, nodes in old_groups.items():
+                            g_id = str(uuid.uuid4())
+                            name_to_id_map[g_name] = g_id
+                            new_groups.append({
+                                "id": g_id,
+                                "name": g_name,
+                                "parent_id": None,
+                                "nodes": nodes
+                            })
+                        self.data_store["groups"] = new_groups
+                        
+                        # 修正调度计划关联（由名称关联改为 ID 关联）
+                        for sched in self.data_store["schedules"]:
+                            old_g_name = sched.get("group")
+                            if old_g_name in name_to_id_map:
+                                sched["group_id"] = name_to_id_map[old_g_name]
+                                # 兼容性：保留 group 字段用于显示，新增 group_id 用于逻辑
+                        
+                        self.save()
+                        global_logger.info("Data migration completed successfully.")
+                    # ---------------------------------------------
+                    
                     loaded = True
                     if path != self.data_file:
                         global_logger.warning(f"Primary config corrupted, restored from backup: {path}")
@@ -50,12 +92,11 @@ class PersistenceManager:
             if os.path.exists(self.data_file):
                 bak_file = self.data_file + ".bak"
                 try:
-                    if os.path.exists(bak_file):
-                        os.remove(bak_file)
-                    os.rename(self.data_file, bak_file)
+                    # 使用 os.replace 替代 os.rename，前者在 Windows 上也能原子覆盖
+                    os.replace(self.data_file, bak_file)
                 except OSError:
                     pass  # 备份失败不阻塞主流程
-            os.rename(tmp_file, self.data_file)
+            os.replace(tmp_file, self.data_file)
             global_logger.debug(f"Configuration saved to {self.data_file}")
         except Exception as e:
             global_logger.error(f"Failed to save configuration: {e}")
@@ -79,43 +120,91 @@ class PersistenceManager:
         self.data_store["aliases"].update(alias_dict)
         self.save()
 
-    # --- Group API (分组管理) ---
-    def get_groups(self) -> dict:
-        return self.data_store.get("groups", {})
+    # --- Group API (多级分组管理) ---
+    def get_groups(self) -> list:
+        """返回分组列表对象"""
+        return self.data_store.get("groups", [])
 
-    def add_group(self, group_name: str) -> bool:
-        if group_name in self.data_store["groups"]:
-            return False
-        self.data_store["groups"][group_name] = []
+    def add_group(self, group_name: str, parent_id: str = None) -> str:
+        """添加分组，返回新分组的 ID"""
+        new_id = str(uuid.uuid4())
+        new_group = {
+            "id": new_id,
+            "name": group_name,
+            "parent_id": parent_id,
+            "nodes": []
+        }
+        self.data_store["groups"].append(new_group)
         self.save()
-        return True
+        return new_id
         
-    def rename_group(self, old_name: str, new_name: str) -> bool:
-        if old_name not in self.data_store["groups"] or new_name in self.data_store["groups"]:
-            return False
-        nodes = self.data_store["groups"].pop(old_name)
-        self.data_store["groups"][new_name] = nodes
-        self.save()
-        return True
-        
-    def delete_group(self, group_name: str):
-        if group_name in self.data_store["groups"]:
-            del self.data_store["groups"][group_name]
-            self.save()
-            return True
+    def rename_group(self, group_id: str, new_name: str) -> bool:
+        for g in self.data_store["groups"]:
+            if g["id"] == group_id:
+                g["name"] = new_name
+                self.save()
+                return True
         return False
         
-    def update_group_members(self, group_name: str, node_ids: list):
-        if group_name in self.data_store["groups"]:
-            self.data_store["groups"][group_name] = node_ids
-            self.save()
+    def delete_group(self, group_id: str):
+        """删除分组及其所有子分组"""
+        to_delete = {group_id}
+        
+        # 递归寻找子孙
+        def find_descendants(pid):
+            for g in self.data_store["groups"]:
+                if g["parent_id"] == pid:
+                    to_delete.add(g["id"])
+                    find_descendants(g["id"])
+                    
+        find_descendants(group_id)
+        
+        # 批量过滤
+        self.data_store["groups"] = [g for g in self.data_store["groups"] if g["id"] not in to_delete]
+        # 同时清理关联的调度计划
+        self.data_store["schedules"] = [s for s in self.data_store["schedules"] if s.get("group_id") not in to_delete]
+        
+        self.save()
+        return True
+        
+    def update_group_members(self, group_id: str, node_ids: list):
+        for g in self.data_store["groups"]:
+            if g["id"] == group_id:
+                g["nodes"] = node_ids
+                self.save()
+                return True
+        return False
+
+    def get_group_nodes_recursive(self, group_id: str) -> set:
+        """递归获取当前组及其所有子孙组关联的 OPC 节点 ID 集合"""
+        all_node_ids = set()
+        visited = set()
+        
+        def collect(gid):
+            if gid in visited:
+                return
+            visited.add(gid)
+            for g in self.data_store["groups"]:
+                if g["id"] == gid:
+                    all_node_ids.update(g.get("nodes", []))
+                if g["parent_id"] == gid:
+                    collect(g["id"])
+                    
+        collect(group_id)
+        return all_node_ids
+
+    def get_group_by_id(self, group_id: str):
+        for g in self.data_store["groups"]:
+            if g["id"] == group_id:
+                return g
+        return None
 
     # --- Schedule API (调度器预留) ---
     def get_schedules(self):
         return self.data_store.get("schedules", [])
         
     def add_schedule(self, schedule_dict):
-        """传入字典包含: id, group, time(HH:MM), action(bool), enabled"""
+        """传入字典包含: id, group_id, time(HH:MM), action(bool), enabled"""
         if "schedules" not in self.data_store:
             self.data_store["schedules"] = []
         self.data_store["schedules"].append(schedule_dict)
@@ -124,6 +213,13 @@ class PersistenceManager:
     def delete_schedule(self, sched_id):
         schedules = self.data_store.get("schedules", [])
         self.data_store["schedules"] = [s for s in schedules if s.get("id") != sched_id]
+        self.save()
+
+    def batch_add_schedules(self, schedule_list):
+        """批量添加多个调度计划，一次性持久化，避免 N 次磁盘 IO"""
+        if "schedules" not in self.data_store:
+            self.data_store["schedules"] = []
+        self.data_store["schedules"].extend(schedule_list)
         self.save()
         
     def update_schedule(self, sched_id, updated_fields: dict):

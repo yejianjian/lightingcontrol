@@ -13,9 +13,9 @@ class GroupScheduler:
         self.engine = opc_engine
         self.running = False
         self._task = None
-        self.pending_actions = [] # 元素结构: {"group": name, "action": bool, "timestamp": datetime}
-        # 并发控制：限制同时进行的写入任务数量，防止瞬间冲击服务器和网络
-        self._semaphore = asyncio.Semaphore(30) 
+        self.pending_actions = [] # 元素结构: {"group_id": uuid, "action": bool, "timestamp": datetime}
+        # 并发控制：延迟初始化，避免在事件循环尚未启动时绑定 Semaphore
+        self._semaphore = None
 
     def start(self):
         if not self.running:
@@ -44,14 +44,18 @@ class GroupScheduler:
 
     async def _scheduler_loop(self):
         global_logger.info("Group Scheduler background tick loop actually started running.")
-        last_triggered_minute = -1
+        # 延迟初始化 Semaphore，确保当前事件循环已启动
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(30)
+        # 使用 (hour, minute) 元组避免跨小时重复问题
+        last_triggered_time = (-1, -1)
         while self.running:
             try:
                 now = datetime.now()
-                current_minute = now.minute
+                current_time_key = (now.hour, now.minute)
                 
                 # 每分钟只触发一次判断
-                if current_minute != last_triggered_minute:
+                if current_time_key != last_triggered_time:
                     schedules = self.dm.pm.get_schedules()
                     current_time_str = now.strftime("%H:%M")
                     
@@ -69,28 +73,44 @@ class GroupScheduler:
                                 global_logger.debug(f"Schedule '{sched.get('id')}' time matched but weekday {current_weekday} not in {weekdays}, skipping.")
                                 continue
 
-                            group_name = sched.get("group")
+                            group_id = sched.get("group_id") # 关联 UUID
                             action = sched.get("action") # True / False
                             
+                            group_obj = self.dm.pm.get_group_by_id(group_id)
+                            if not group_obj:
+                                global_logger.warning(f"Scheduler triggered for non-existent group ID: {group_id}")
+                                continue
+                            
+                            group_name = group_obj.get("name")
                             global_logger.info(f"Scheduler triggered! Executing group '{group_name}' action: {'ON' if action else 'OFF'}")
                             # 不阻塞主循环，开启任务执行
-                            asyncio.create_task(self._execute_group_action(group_name, action))
+                            asyncio.create_task(self._execute_group_action(group_id, action))
                             
-                    last_triggered_minute = current_minute
+                    last_triggered_time = current_time_key
                 
-                # 若连接正常且有未决任务，则执行补偿并清理过期任务
+                # 若连接正常且有未决任务，则执行补偿并且在成功后移除
                 if self.engine.connected and self.pending_actions:
-                    actions_to_run = self.pending_actions.copy()
-                    self.pending_actions.clear()
-                    
-                    for action_pkg in actions_to_run:
+                    completed_indices = []
+                    for idx, action_pkg in enumerate(self.pending_actions):
                         ts_str = action_pkg["timestamp"].strftime("%H:%M:%S")
+                        g_id = action_pkg["group_id"]
+                        g_obj = self.dm.pm.get_group_by_id(g_id)
+                        g_display = g_obj.get("name") if g_obj else g_id
                         # 检查是否过期 (超时 10 分钟作废)
-                        if (now - action_pkg["timestamp"]).total_seconds() <= 600:
-                            global_logger.info(f"Recovery: Executing missed task for group '{action_pkg['group']}' (originally at {ts_str})")
-                            asyncio.create_task(self._execute_group_action(action_pkg["group"], action_pkg["action"], is_recovery=True))
+                        if (now - action_pkg["timestamp"]).total_seconds() > 600:
+                            global_logger.warning(f"Recovery: Discarded expired (10min+) pending task for group '{g_display}' (originally at {ts_str})")
+                            completed_indices.append(idx)
                         else:
-                            global_logger.warning(f"Recovery: Discarded expired (10min+) pending task for group '{action_pkg['group']}' (originally at {ts_str})")
+                            global_logger.info(f"Recovery: Executing missed task for group '{g_display}' (originally at {ts_str})")
+                            try:
+                                await self._execute_group_action(g_id, action_pkg["action"], is_recovery=True)
+                                completed_indices.append(idx)  # 仅在执行成功后标记移除
+                            except Exception as e:
+                                global_logger.error(f"Recovery execution failed for group '{g_display}': {e}")
+                    
+                    # 倒序移除已完成的任务，避免索引偏移
+                    for idx in reversed(completed_indices):
+                        self.pending_actions.pop(idx)
                     
             except asyncio.CancelledError:
                 break
@@ -99,37 +119,49 @@ class GroupScheduler:
                 
             await asyncio.sleep(2)  # 每2秒探测一次，防止错过
 
-    async def _execute_group_action(self, group_name, action, is_recovery=False):
+    async def _execute_group_action(self, group_id, action, is_recovery=False):
+        group_obj = self.dm.pm.get_group_by_id(group_id)
+        group_name = group_obj.get("name") if group_obj else "Unknown"
+
         if not self.engine.connected:
             if not is_recovery:
                 # 入队前去重：同组+同操作不重复入队
                 already_queued = any(
-                    p["group"] == group_name and p["action"] == action
+                    p.get("group_id") == group_id and p["action"] == action
                     for p in self.pending_actions
                 )
                 if not already_queued:
                     global_logger.warning(f"Scheduler active but OPC engine is disconnected. Task for group '{group_name}' queued for recovery.")
-                    self.pending_actions.append({"group": group_name, "action": action, "timestamp": datetime.now()})
+                    self.pending_actions.append({"group_id": group_id, "action": action, "timestamp": datetime.now()})
                 else:
-                    global_logger.debug(f"Duplicate pending task for '{group_name}' skipped.")
+                    global_logger.debug(f"Duplicate pending task for '{group_name}' (ID: {group_id}) skipped.")
             return
             
-        members = self.dm.pm.get_groups().get(group_name, [])
+        # 递归获取成员（包含所有子分组的控制点）
+        members = self.dm.pm.get_group_nodes_recursive(group_id)
         if not members:
-             global_logger.warning(f"Scheduler active but group '{group_name}' is empty or does not exist.")
+             global_logger.warning(f"Scheduler active but group '{group_name}' (ID: {group_id}) is empty or has no nodes recursive.")
              return
 
         async def _limited_write(nid, val):
             async with self._semaphore:
+                # 获取别名用于日志显示
+                alias = self.dm.get_alias_by_node_id(nid)
                 try:
-                    success = await self.engine.write_node_value(nid, val)
+                    success = await self.engine.write_node_value(nid, val, display_name=alias)
                     if not success:
-                        global_logger.error(f"Scheduled write failed for node {nid}")
+                        global_logger.error(f"Scheduled write failed for node {alias}")
                 except Exception as e:
-                    global_logger.error(f"Exception during scheduled write for {nid}: {e}")
+                    global_logger.error(f"Exception during scheduled write for {alias}: {e}")
 
-        # 并发执行组内所有节点的写入，但受 semaphore 限制
-        tasks = [asyncio.create_task(_limited_write(nid, action)) for nid in members]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            global_logger.info(f"Group action '{group_name}' execution completed ({len(members)} nodes).")
+        # 分批并发执行，每批 50 个节点，批次间间隔 0.1s，避免压垮 OPC 服务器
+        member_list = list(members)
+        batch_size = 50
+        for i in range(0, len(member_list), batch_size):
+            batch = member_list[i:i+batch_size]
+            tasks = [asyncio.create_task(_limited_write(nid, action)) for nid in batch]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if i + batch_size < len(member_list):
+                await asyncio.sleep(0.1)
+        global_logger.info(f"Group action '{group_name}' execution completed ({len(members)} nodes recursive).")
