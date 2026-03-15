@@ -11,7 +11,8 @@ global_logger = DummyLogger()
 class DummyDM:
     class DummyPM:
         def get_schedules(self):
-            return [{"enabled": True, "time": datetime.now().strftime("%H:%M"), "group": "test", "action": True}]
+            # 模拟一个在今天执行的任务 (6=Sunday, Assuming today is 2026-03-15 Sun)
+            return [{"enabled": True, "time": datetime.now().strftime("%H:%M"), "group": "test", "action": True, "weekdays": [6]}]
         def get_groups(self):
             return {"test": ["1", "2"]}
     pm = DummyPM()
@@ -41,6 +42,7 @@ class GroupScheduler:
         while self.running:
             try:
                 now = datetime.now()
+                current_weekday = now.weekday()
                 current_minute = now.minute
                 
                 # 每分钟只触发一次判断
@@ -54,8 +56,14 @@ class GroupScheduler:
                             
                         trigger_time = sched.get("time") 
                         if trigger_time == current_time_str:
+                            # 星期过滤逻辑
+                            weekdays = sched.get("weekdays")
+                            if weekdays is not None and current_weekday not in weekdays:
+                                print(f"Schedule matched time but weekday {current_weekday} not in {weekdays}, skipping.")
+                                continue
+
                             group_name = sched.get("group")
-                            action = sched.get("action") # True / False
+                            action = sched.get("action")
                             
                             global_logger.info(f"Scheduler triggered! Executing group '{group_name}' action: {'ON' if action else 'OFF'}")
                             await self._execute_group_action(group_name, action)
@@ -65,29 +73,21 @@ class GroupScheduler:
             except Exception as e:
                 global_logger.error(f"Scheduler error: {e}")
                 
-            await asyncio.sleep(2)  # 每2秒探测一次
+            await asyncio.sleep(2)
 
     async def _execute_group_action(self, group_name, action):
         if not self.engine.connected:
-            global_logger.warning("Scheduler active but OPC engine is disconnected. Discarding scheduled task.")
+            global_logger.warning("OPC engine disconnected.")
             return
             
         members = self.dm.pm.get_groups().get(group_name, [])
-        if not members:
-             global_logger.warning(f"Scheduler active but group '{group_name}' is empty or does not exist.")
-             return
-
-        def _task_err_callback(t):
-            if t.exception():
-                global_logger.error(f"Scheduled write task failed: {t.exception()}")
-
         for nid in members:
             task = asyncio.ensure_future(self.engine.write_node_value(nid, action))
-            task.add_done_callback(_task_err_callback)
 
 async def main():
     gs = GroupScheduler(DummyDM(), DummyEngine())
     gs.start()
     await asyncio.sleep(5)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,4 +1,5 @@
 import pandas as pd
+import re
 from utils.logger import global_logger
 from core.data_manager import DataManager
 
@@ -34,12 +35,29 @@ def import_aliases_from_excel(file_path: str, dm: DataManager) -> tuple:
         df = df.dropna(subset=[node_col, alias_col])
         dict_mapping = dict(zip(df[node_col].astype(str), df[alias_col].astype(str)))
         
+        # 准备“标识符 -> 全量ID”的映射表
+        all_nodes = dm.get_node_list()
+        short_id_to_full = {}
+        for node in all_nodes:
+            full_id = node.get('node_id', '')
+            match = re.search(r'[isgb]=(.+)', full_id)
+            if match:
+                short_id_to_full[match.group(1)] = full_id
+            # 同时也保留全量映射以支持直接匹配
+            short_id_to_full[full_id] = full_id
+
         imported_count = 0
         valid_aliases = {}
         for nid, alias in dict_mapping.items():
             if nid and alias and alias.lower() != 'nan':
-                valid_aliases[nid] = alias
-                imported_count += 1
+                # 先尝试短 ID 匹配，再尝试原始匹配
+                # 兼容 Excel 将数字 ID 读取为 '1001.0' 的情况
+                nid_clean = nid.split('.')[0] if '.' in nid and nid.split('.')[1] == '0' else nid
+                
+                target_full_id = short_id_to_full.get(nid_clean) or short_id_to_full.get(nid)
+                if target_full_id:
+                    valid_aliases[target_full_id] = alias
+                    imported_count += 1
         
         # 批量写入，一次性持久化，避免 N 次磁盘 IO
         if valid_aliases:

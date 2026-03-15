@@ -14,6 +14,8 @@ class GroupScheduler:
         self.running = False
         self._task = None
         self.pending_actions = [] # 元素结构: {"group": name, "action": bool, "timestamp": datetime}
+        # 并发控制：限制同时进行的写入任务数量，防止瞬间冲击服务器和网络
+        self._semaphore = asyncio.Semaphore(30) 
 
     def start(self):
         if not self.running:
@@ -59,26 +61,36 @@ class GroupScheduler:
                             
                         trigger_time = sched.get("time") 
                         if trigger_time == current_time_str:
+                            # 星期过滤逻辑
+                            weekdays = sched.get("weekdays") # 0-6 列表，如果为 None 则默认每天
+                            current_weekday = now.weekday() # 0=周一, 6=周日
+                            
+                            if weekdays is not None and current_weekday not in weekdays:
+                                global_logger.debug(f"Schedule '{sched.get('id')}' time matched but weekday {current_weekday} not in {weekdays}, skipping.")
+                                continue
+
                             group_name = sched.get("group")
                             action = sched.get("action") # True / False
                             
                             global_logger.info(f"Scheduler triggered! Executing group '{group_name}' action: {'ON' if action else 'OFF'}")
-                            await self._execute_group_action(group_name, action)
+                            # 不阻塞主循环，开启任务执行
+                            asyncio.create_task(self._execute_group_action(group_name, action))
                             
                     last_triggered_minute = current_minute
                 
                 # 若连接正常且有未决任务，则执行补偿并清理过期任务
                 if self.engine.connected and self.pending_actions:
-                    for action_pkg in self.pending_actions:
+                    actions_to_run = self.pending_actions.copy()
+                    self.pending_actions.clear()
+                    
+                    for action_pkg in actions_to_run:
                         ts_str = action_pkg["timestamp"].strftime("%H:%M:%S")
                         # 检查是否过期 (超时 10 分钟作废)
                         if (now - action_pkg["timestamp"]).total_seconds() <= 600:
                             global_logger.info(f"Recovery: Executing missed task for group '{action_pkg['group']}' (originally at {ts_str})")
-                            await self._execute_group_action(action_pkg["group"], action_pkg["action"], is_recovery=True)
+                            asyncio.create_task(self._execute_group_action(action_pkg["group"], action_pkg["action"], is_recovery=True))
                         else:
                             global_logger.warning(f"Recovery: Discarded expired (10min+) pending task for group '{action_pkg['group']}' (originally at {ts_str})")
-                    # 只要连着网，本轮不管是成功补偿还是过期丢弃，都将其清空
-                    self.pending_actions = []
                     
             except asyncio.CancelledError:
                 break
@@ -107,11 +119,17 @@ class GroupScheduler:
              global_logger.warning(f"Scheduler active but group '{group_name}' is empty or does not exist.")
              return
 
-        def _task_err_callback(t):
-            if not t.cancelled() and t.exception():
-                global_logger.error(f"Scheduled write task failed: {t.exception()}")
+        async def _limited_write(nid, val):
+            async with self._semaphore:
+                try:
+                    success = await self.engine.write_node_value(nid, val)
+                    if not success:
+                        global_logger.error(f"Scheduled write failed for node {nid}")
+                except Exception as e:
+                    global_logger.error(f"Exception during scheduled write for {nid}: {e}")
 
-        for nid in members:
-            # 不需要等待每一个结果同步，将其推向后台即可实现并行执行
-            task = asyncio.ensure_future(self.engine.write_node_value(nid, action))
-            task.add_done_callback(_task_err_callback)
+        # 并发执行组内所有节点的写入，但受 semaphore 限制
+        tasks = [asyncio.create_task(_limited_write(nid, action)) for nid in members]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            global_logger.info(f"Group action '{group_name}' execution completed ({len(members)} nodes).")

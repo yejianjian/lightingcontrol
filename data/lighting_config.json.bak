@@ -41,6 +41,17 @@
       ],
       "action": true,
       "enabled": true
+    },
+    {
+      "id": "5f3c2602-8023-48fc-8ae3-2448f8ae72f3",
+      "group": "2",
+      "time": "10:01",
+      "weekdays": [
+        4,
+        5
+      ],
+      "action": true,
+      "enabled": true
     }
   ]
 }

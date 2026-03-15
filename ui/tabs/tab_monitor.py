@@ -199,12 +199,25 @@ class TabMonitor(QWidget):
 
         try:
             import pandas as pd
+            import re
             rows = []
             for n in all_nodes:
+                full_id = n.get('node_id', '')
+                # 提取标识符部分 (支持 i=, s=, g=, b=)
+                match = re.search(r'[isgb]=(.+)', full_id)
+                short_id = match.group(1) if match else full_id
+                
+                val = n.get('value')
+                if isinstance(val, bool):
+                    val_str = "开启" if val else "关闭"
+                else:
+                    val_str = str(val) if val is not None else ""
+
                 rows.append({
-                    "Node ID": n.get('node_id', ''),
+                    "Node ID": short_id,
                     "备注名/别名": n.get('alias', n.get('name', '')),
-                    "数据类型": n.get('type', '')
+                    "数据类型": n.get('type', ''),
+                    "当前状态/数据": val_str
                 })
             df = pd.DataFrame(rows)
             df.to_excel(file_path, index=False)

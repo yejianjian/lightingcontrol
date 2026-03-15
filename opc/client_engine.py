@@ -139,44 +139,59 @@ class OpcClientEngine:
             return True
         except Exception as e:
             self.connected = False
+            # 确保即使连接失败也清理 client 引用
+            self.client = None
             raise e
 
     def _start_monitor(self):
         """启动后台连接监视协程"""
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
-        self._monitor_task = asyncio.ensure_future(self._monitor_connection())
+        self._monitor_task = asyncio.create_task(self._monitor_connection())
 
     async def _monitor_connection(self):
         """心跳检测：定期读取服务器状态节点，检测断线"""
-        while self.connected:
-            await asyncio.sleep(20) # 原5秒，放宽至20秒以防狂刷日志
-            if not self.connected:
-                break
-            try:
-                # 读取服务器状态节点（标准 OPC UA 节点）作为心跳
-                server_state = self.client.get_node("i=2259")
-                await server_state.read_value()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                global_logger.error(f"Connection monitor detected failure: {e}")
-                self.connected = False
-                if self.on_connection_lost and callable(self.on_connection_lost):
-                    try:
-                        self.on_connection_lost()
-                    except Exception as cb_err:
-                        global_logger.error(f"on_connection_lost callback error: {cb_err}")
-                break
+        try:
+            while self.connected:
+                await asyncio.sleep(20) # 原5秒，放宽至20秒以防狂刷日志
+                if not self.connected:
+                    break
+                try:
+                    # 读取服务器状态节点（标准 OPC UA 节点）作为心跳
+                    server_state = self.client.get_node("i=2259")
+                    await server_state.read_value()
+                except (asyncio.CancelledError, GeneratorExit):
+                    break
+                except Exception as e:
+                    global_logger.error(f"Connection monitor detected failure: {e}")
+                    self.connected = False
+                    if self.on_connection_lost and callable(self.on_connection_lost):
+                        try:
+                            self.on_connection_lost()
+                        except Exception as cb_err:
+                            global_logger.error(f"on_connection_lost callback error: {cb_err}")
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            global_logger.debug("Connection monitor task exited.")
             
     async def disconnect(self):
-        # 先停止心跳监视
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
+        # 先标记为不连通，防止监控任务进入下一次循环
+        self.connected = False
+
+        # 停止心跳监视
+        if self._monitor_task:
+            if not self._monitor_task.done():
+                self._monitor_task.cancel()
+                try:
+                    await asyncio.wait_for(self._monitor_task, timeout=2.0)
+                except Exception:
+                    pass
             self._monitor_task = None
             
         try:
-            if self.subscription and self.connected:
+            if self.subscription:
                 await self.subscription.delete()
         except Exception as e:
             global_logger.warning(f"Error deleting subscription: {e}")
@@ -184,12 +199,14 @@ class OpcClientEngine:
             self.subscription = None
 
         try:
-            if self.client and self.connected:
+            if self.client:
                 await self.client.disconnect()
         except Exception as e:
             global_logger.warning(f"Error disconnecting client: {e}")
         finally:
-            self.connected = False
+            self.client = None
+            # 清理节点引用，协助 GC
+            self.nodes.clear()
 
     async def get_all_nodes(self):
         if not self.connected:
@@ -290,11 +307,16 @@ class OpcClientEngine:
                 cached_type = self.nodes[node_id].get('type', '')
                 if 'Int' in cached_type:
                     variant_type = getattr(ua.VariantType, cached_type, ua.VariantType.Int16)
+                    value = int(value)
                 elif 'Float' in cached_type or 'Double' in cached_type or 'Real' in cached_type:
                     variant_type = getattr(ua.VariantType, cached_type, ua.VariantType.Double)
+                    value = float(value)
                 elif 'String' in cached_type:
                      variant_type = ua.VariantType.String
                      value = str(value)
+                elif 'Boolean' in cached_type:
+                     variant_type = ua.VariantType.Boolean
+                     value = bool(value)
 
             data_value = ua.DataValue(ua.Variant(value, variant_type))
             

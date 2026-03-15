@@ -1,15 +1,17 @@
 try:
     from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog)
+                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox)
     from PyQt5.QtCore import Qt, QTime
 except ImportError:
     from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog)
+                                 QListWidget, QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QListWidgetItem, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox)
     from PySide6.QtCore import Qt, QTime
     
 import uuid
 import asyncio
 import json
+import re
+import pandas as pd
 from utils.logger import global_logger
 from utils.filter_helper import filter_nodes
 from ui.tabs.tab_monitor import MonitorTableModel
@@ -140,9 +142,23 @@ class TabGroup(QWidget):
         ctrl_layout.addWidget(self.btn_del_sched)
         sched_layout.addLayout(ctrl_layout)
         
+        # 星期复选框列
+        week_layout = QHBoxLayout()
+        week_layout.addWidget(QLabel(" 重复:"))
+        self.week_checkboxes = []
+        days = ["一", "二", "三", "四", "五", "六", "日"]
+        for i, day in enumerate(days):
+            cb = QCheckBox(day)
+            cb.setChecked(True) # 默认全选
+            cb.setMinimumWidth(40)
+            self.week_checkboxes.append(cb)
+            week_layout.addWidget(cb)
+        week_layout.addStretch()
+        sched_layout.addLayout(week_layout)
+        
         self.table_sched = QTableWidget()
-        self.table_sched.setColumnCount(5)
-        self.table_sched.setHorizontalHeaderLabels(["ID", "目标分组", "触发时间", "动作指令", "状态"])
+        self.table_sched.setColumnCount(6)
+        self.table_sched.setHorizontalHeaderLabels(["ID", "目标分组", "触发时间", "重复日期", "动作指令", "状态"])
         header_sched = self.table_sched.horizontalHeader()
         header_sched.setSectionResizeMode(QHeaderView.Interactive)
         header_sched.setStretchLastSection(True)
@@ -242,54 +258,93 @@ class TabGroup(QWidget):
             return
             
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "导出分组配置", "lighting_groups_export.json", "JSON Files (*.json)"
+            self, "导出分组配置", "lighting_groups_export.xlsx", "Excel Files (*.xlsx)"
         )
         if not file_path:
             return
             
         try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(groups, f, indent=4, ensure_ascii=False)
-            QMessageBox.information(self, "导出成功", f"成功导出 {len(groups)} 个分组配置。")
+            export_rows = []
+            for g_name, member_ids in groups.items():
+                for full_id in member_ids:
+                    # 提取标识符部分 (支持 i=, s=, g=, b=)
+                    match = re.search(r'[isgb]=(.+)', full_id)
+                    short_id = match.group(1) if match else full_id
+                    export_rows.append({
+                        "分组名称": g_name,
+                        "节点标识": short_id
+                    })
+            
+            if not export_rows:
+                # 如果有空组但也想导出列名
+                df = pd.DataFrame(columns=["分组名称", "节点标识"])
+            else:
+                df = pd.DataFrame(export_rows)
+                
+            df.to_excel(file_path, index=False)
+            QMessageBox.information(self, "导出成功", f"成功导出 {len(groups)} 个分组配置到 Excel。")
         except Exception as e:
+            global_logger.error(f"Failed to export Excel: {e}")
             QMessageBox.critical(self, "异常", f"导出失败: {e}")
 
     def on_import_groups(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "导入分组配置", "", "JSON Files (*.json)"
+            self, "导入分组配置", "", "Excel Files (*.xlsx)"
         )
         if not file_path:
             return
             
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                import_data = json.load(f)
-                
-            if not isinstance(import_data, dict):
-                raise ValueError("JSON格式不合法（应为字典结构）。")
-                
+            df = pd.read_excel(file_path)
+            if df.empty or "分组名称" not in df.columns or "节点标识" not in df.columns:
+                raise ValueError("Excel 格式不正确，必须包含 '分组名称' 和 '节点标识' 列。")
+
+            # 获取当前系统中所有全量 ID 映射
+            all_nodes = self.dm.get_node_list()
+            id_map = {} # short_id/string_id -> full_id
+            for node in all_nodes:
+                full_id = node.get('node_id', '')
+                match = re.search(r'[isgb]=(.+)', full_id)
+                if match:
+                    id_map[match.group(1)] = full_id
+                else:
+                    id_map[full_id] = full_id # 兜底逻辑
+
             current_groups = self.dm.pm.get_groups()
-            imported_count = 0
+            imported_data = {} # group -> [full_ids]
             
-            for g_name, member_list in import_data.items():
-                if not isinstance(member_list, list):
-                    continue # 略过结构不严谨的项
+            for _, row in df.iterrows():
+                g_name = str(row["分组名称"]).strip()
+                raw_id = str(row["节点标识"]).strip()
                 
+                if not g_name or not raw_id:
+                    continue
+                
+                # 兼容 Excel 将数字 ID 读取为 '1001.0' 的情况
+                clean_id = raw_id.split('.')[0] if '.' in raw_id and raw_id.split('.')[1] == '0' else raw_id
+                
+                full_id = id_map.get(clean_id) or id_map.get(raw_id)
+                if full_id:
+                    if g_name not in imported_data:
+                        imported_data[g_name] = []
+                    imported_data[g_name].append(full_id)
+            
+            imported_count = 0
+            for g_name, member_list in imported_data.items():
                 if g_name in current_groups:
                     # 并集去重合并
                     merged_members = list(set(current_groups[g_name] + member_list))
                     current_groups[g_name] = merged_members
                 else:
-                    # 修复：直接赋值字典而不在循环内调用 add_group，防止 O(N) 次密集磁盘 save() I/O
                     current_groups[g_name] = member_list
-                
                 imported_count += 1
                 
             self.dm.pm.save()
             self.refresh_groups_list()
-            QMessageBox.information(self, "导入成功", f"成功从配置文件合并了 {imported_count} 个分组逻辑。")
+            QMessageBox.information(self, "导入成功", f"成功从 Excel 合并了 {imported_count} 个分组逻辑。")
         except Exception as e:
-            QMessageBox.critical(self, "导入失败", f"配置文件读取或合并出错: {e}")
+            global_logger.error(f"Failed to import Excel: {e}")
+            QMessageBox.critical(self, "导入失败", f"Excel 读取或合并出错: {e}")
                  
                  
     def on_group_selection_changed(self, current, previous):
@@ -422,8 +477,22 @@ class TabGroup(QWidget):
             self.table_sched.setItem(row, 1, QTableWidgetItem(s.get("group", "")))
             self.table_sched.setItem(row, 2, QTableWidgetItem(s.get("time", "")))
             
+            # 显示日期
+            week_data = s.get("weekdays")
+            if week_data is None:
+                week_text = "每天"
+            elif not week_data:
+                week_text = "永不"
+            elif len(week_data) == 7:
+                week_text = "每天"
+            else:
+                days_map = {0:"一", 1:"二", 2:"三", 3:"四", 4:"五", 5:"六", 6:"日"}
+                week_text = ",".join([days_map[d] for d in sorted(week_data)])
+            
+            self.table_sched.setItem(row, 3, QTableWidgetItem(week_text))
+            
             action_text = "开启" if s.get("action") else "关闭"
-            self.table_sched.setItem(row, 3, QTableWidgetItem(action_text))
+            self.table_sched.setItem(row, 4, QTableWidgetItem(action_text))
             
             is_enabled = s.get("enabled", True)
             btn_status = QPushButton("🟢 已开启" if is_enabled else "🔴 已关闭")
@@ -435,7 +504,7 @@ class TabGroup(QWidget):
             # 闭包绑定当前id和前状态
             btn_status.clicked.connect(lambda chk, _id=s.get("id"), curr=is_enabled: self.on_toggle_schedule(_id, curr))
             
-            self.table_sched.setCellWidget(row, 4, btn_status)
+            self.table_sched.setCellWidget(row, 5, btn_status)
             
     def on_toggle_schedule(self, sched_id, current_status):
         new_status = not current_status
@@ -461,11 +530,18 @@ class TabGroup(QWidget):
         time_str = self.time_edit.time().toString("HH:mm")
         is_on = self.cb_action.currentText() == "开启"
         
+        # 获取勾选的日期
+        weekdays = []
+        for i, cb in enumerate(self.week_checkboxes):
+            if cb.isChecked():
+                weekdays.append(i)
+        
         for g_name in checked_groups:
             sched_dict = {
                 "id": str(uuid.uuid4()),
                 "group": g_name,
                 "time": time_str,
+                "weekdays": weekdays,
                 "action": is_on,
                 "enabled": True
             }

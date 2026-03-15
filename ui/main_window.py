@@ -28,7 +28,7 @@ from core.group_scheduler import GroupScheduler
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("灯光自动控制系统 - Central Lighting Control (by jianjian)")
+        self.setWindowTitle("灯光自动控制系统 V1.1.0")
         # 宽屏比例适配
         self.resize(1100, 750)
         
@@ -115,7 +115,10 @@ class MainWindow(QMainWindow):
         self._update_clock()  # 立即显示一次
 
     def _update_clock(self):
-        self.lbl_clock.setText(f"🕒 当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        now = datetime.now()
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        weekday_str = weekdays[now.weekday()]
+        self.lbl_clock.setText(f"🕒 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')} {weekday_str}")
 
     def _create_dash_panel(self, text, color="black", bg_color="white"):
         lbl = QLabel(text)
@@ -193,6 +196,14 @@ class MainWindow(QMainWindow):
                     loop.run_until_complete(self.opc_engine.disconnect())
                 except Exception as e:
                     global_logger.warning(f"Error during shutdown disconnect: {e}")
+            
+            # 停止事件循环，让 main.py 中的 loop.run_forever() 退出
+            try:
+                loop = asyncio.get_event_loop()
+                loop.stop()
+            except Exception:
+                pass
+
             event.accept()
             global_logger.info("Application shutdown by user.")
         else:
