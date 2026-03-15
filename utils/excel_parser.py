@@ -40,7 +40,7 @@ def import_aliases_from_excel(file_path: str, dm: DataManager) -> tuple:
         short_id_to_full = {}
         for node in all_nodes:
             full_id = node.get('node_id', '')
-            match = re.search(r'[isgb]=(.+)', full_id)
+            match = re.search(r';[isgb]=(.+)', full_id)
             if match:
                 short_id_to_full[match.group(1)] = full_id
             # 同时也保留全量映射以支持直接匹配

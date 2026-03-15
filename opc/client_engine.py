@@ -262,7 +262,9 @@ class OpcClientEngine:
         
         await browse_recursive(objects_node)
         self.nodes = {n['node_id']: n for n in discovered_nodes}
-        return discovered_nodes
+        # 返回给外层的数据剥离 node_obj（底层 asyncua 引用），
+        # node_obj 仅保留在 self.nodes 内部缓存中供订阅使用
+        return [{k: v for k, v in n.items() if k != 'node_obj'} for n in discovered_nodes]
 
     async def start_subscription(self, callback):
         if not self.connected or not self.nodes: return

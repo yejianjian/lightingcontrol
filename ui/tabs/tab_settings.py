@@ -23,12 +23,14 @@ class TabSettings(QWidget):
         grp_conn = QGroupBox("OPC UA 服务器连接配置")
         form_conn = QFormLayout(grp_conn)
 
-        self.le_host = QLineEdit("127.0.0.1")
-        self.le_port = QLineEdit("48401")
-        self.le_user = QLineEdit("admin")
-        self.le_pass = QLineEdit("123456")
+        # 从持久化配置中读取上次保存的连接参数
+        saved_conn = self.dm.pm.data_store.get("connection", {})
+        self.le_host = QLineEdit(saved_conn.get("host", "127.0.0.1"))
+        self.le_port = QLineEdit(saved_conn.get("port", "48401"))
+        self.le_user = QLineEdit(saved_conn.get("user", ""))
+        self.le_pass = QLineEdit(saved_conn.get("password", ""))
         self.le_pass.setEchoMode(QLineEdit.Password)
-        self.le_ns_filter = QLineEdit("ns=2;")
+        self.le_ns_filter = QLineEdit(saved_conn.get("ns_filter", "ns=2;"))
         self.le_ns_filter.setToolTip("业务节点命名空间前缀，留空则不过滤")
 
         form_conn.addRow("DA 主机 IP (Host):", self.le_host)
@@ -92,6 +94,16 @@ class TabSettings(QWidget):
             await self.engine.connect()
             global_logger.info("Connected. Loading node tree...")
             
+            # 连接成功后持久化连接参数
+            self.dm.pm.data_store["connection"] = {
+                "host": self.le_host.text().strip(),
+                "port": self.le_port.text().strip(),
+                "user": self.le_user.text().strip(),
+                "password": self.le_pass.text().strip(),
+                "ns_filter": self.le_ns_filter.text().strip(),
+            }
+            self.dm.pm.save()
+            
             # 抓取 OPC 节点树
             nodes = await self.engine.get_all_nodes()
             global_logger.info(f"Grabbed {len(nodes)} valid control nodes.")
@@ -131,8 +143,10 @@ class TabSettings(QWidget):
     def _handle_connection_lost(self):
         global_logger.warning("UI caught connection lost event. Initiating auto-reconnect sequence.")
         
-        # 使用 QTimer.singleShot(0, ...) 确保 UI 操作始终在主线程执行
-        def _update_ui():
+        self._is_reconnecting = True
+        
+        # 使用 QTimer.singleShot(0, ...) 确保 UI 操作和 asyncio 任务创建始终在主线程执行
+        def _update_ui_and_start_reconnect():
             if hasattr(self.window(), 'lbl_dash_mode'):
                 self.window().lbl_dash_mode.setText("系统状态 (连接断开，尝试重连中...)")
                 self.window().lbl_dash_mode.setStyleSheet("background-color: #ffccc7; color: #cf1322; border: 1px solid #ffa39e; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
@@ -140,11 +154,11 @@ class TabSettings(QWidget):
             self.btn_connect.setEnabled(True)
             self.btn_connect.setText("停止自动重连")
             self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+            
+            # 在主线程的事件循环中创建异步任务，避免跨线程 RuntimeError
+            asyncio.create_task(self._auto_reconnect_loop())
         
-        QTimer.singleShot(0, _update_ui)
-        self._is_reconnecting = True
-        
-        asyncio.create_task(self._auto_reconnect_loop())
+        QTimer.singleShot(0, _update_ui_and_start_reconnect)
         
     async def _auto_reconnect_loop(self):
         try:
@@ -167,6 +181,11 @@ class TabSettings(QWidget):
                         self.dm.update_node(n['node_id'], n)
                     await self.engine.start_subscription(self._on_sub_data)
                     
+                    # 重连成功后确保调度器运行中
+                    main_win = self.window()
+                    if hasattr(main_win, 'scheduler') and not main_win.scheduler.running:
+                        main_win.scheduler.start()
+                    
                     self.btn_connect.setText("断开服务器连接")
                     self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
                     if hasattr(self.window(), 'lbl_dash_mode'):
@@ -188,6 +207,8 @@ class TabSettings(QWidget):
     async def _disconnect(self):
         self._is_reconnecting = False
         await self.engine.disconnect()
+        # 清理数据总线中失效的节点数据
+        self.dm.clear_nodes()
         self.btn_connect.setText("连接并挂载服务器节点")
         self.btn_connect.setEnabled(True)
         self.btn_connect.setStyleSheet("font-weight: bold;")

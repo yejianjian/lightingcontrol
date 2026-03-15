@@ -338,7 +338,7 @@ class TabGroup(QWidget):
                 g_name = g["name"]
                 for full_id in g.get("nodes", []):
                     # [V1.2.0 修订] 仅导出标识符的具体值内容，不含 ns=2;s= 前缀
-                    match = re.search(r'[isgb]=(.+)', full_id)
+                    match = re.search(r';[isgb]=(.+)', full_id)
                     short_id = match.group(1) if match else full_id
                     export_rows.append({
                         "分组名称": g_name,
@@ -374,7 +374,7 @@ class TabGroup(QWidget):
             id_map = {} # short_id/string_id -> full_id
             for node in all_nodes:
                 full_id = node.get('node_id', '')
-                match = re.search(r'[isgb]=(.+)', full_id)
+                match = re.search(r';[isgb]=(.+)', full_id)
                 if match:
                     id_map[match.group(1)] = full_id
                 else:
@@ -404,14 +404,21 @@ class TabGroup(QWidget):
                         break
                         
                 if target_g:
-                    # 并集去重合并
+                    # 并集去重合并 — 直接修改内存中的分组数据，最后统一保存
                     merged_members = list(set(target_g.get("nodes", []) + member_list))
-                    self.dm.pm.update_group_members(target_g["id"], merged_members)
+                    target_g["nodes"] = merged_members
                 else:
-                    new_id = self.dm.pm.add_group(g_name)
-                    self.dm.pm.update_group_members(new_id, member_list)
+                    new_id = str(uuid.uuid4())
+                    new_group = {
+                        "id": new_id,
+                        "name": g_name,
+                        "parent_id": None,
+                        "nodes": member_list
+                    }
+                    self.dm.pm.data_store["groups"].append(new_group)
                 imported_count += 1
                 
+            # 批量操作完成后一次性持久化，避免 N 次磁盘 IO
             self.dm.pm.save()
             self.refresh_groups_list()
             QMessageBox.information(self, "导入成功", f"成功从 Excel 合并了 {imported_count} 个分组逻辑。")
@@ -545,23 +552,23 @@ class TabGroup(QWidget):
         action_name = '全开' if action_val else '全关'
         global_logger.info(f"==> 用户点击了批量 {action_name} 操作 | 受影响的分组: {', '.join(display_names)} | 受影响总节点数: {len(combined_member_ids)}")
         
-        def _task_err_callback(t):
-            if not t.cancelled():
-                exc = t.exception()
-                if exc:
-                    global_logger.error(f"批量控制写入失败: {exc}")
-
         # 分批发送写入指令，避免瞬间压垮 OPC 服务器
         async def _batch_write():
             member_list = list(combined_member_ids)
             batch_size = 50
             for i in range(0, len(member_list), batch_size):
                 batch = member_list[i:i+batch_size]
+                tasks = []
                 for nid in batch:
                     # 获取别名用于日志显示
                     alias = self.dm.get_alias_by_node_id(nid)
                     task = asyncio.create_task(self.engine.write_node_value(nid, action_val, display_name=alias))
-                    task.add_done_callback(_task_err_callback)
+                    tasks.append(task)
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for r in results:
+                        if isinstance(r, Exception):
+                            global_logger.error(f"批量控制写入异常: {r}")
                 if i + batch_size < len(member_list):
                     await asyncio.sleep(0.1)
         

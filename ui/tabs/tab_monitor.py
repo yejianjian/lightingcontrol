@@ -204,7 +204,7 @@ class TabMonitor(QWidget):
             for n in all_nodes:
                 full_id = n.get('node_id', '')
                 # [V1.2.0 修订] 仅导出标识符的具体值内容，不含 ns=2;s= 前缀
-                match = re.search(r'[isgb]=(.+)', full_id)
+                match = re.search(r';[isgb]=(.+)', full_id)
                 short_id = match.group(1) if match else full_id
                 
                 val = n.get('value')

@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import uuid
+from contextlib import contextmanager
 from utils.logger import global_logger
 
 def _get_base_dir():
@@ -19,6 +20,7 @@ class PersistenceManager:
         if not os.path.isabs(data_file):
             data_file = os.path.join(_get_base_dir(), data_file)
         self.data_file = data_file
+        self._batch_count = 0  # 批量模式嵌套计数
         self.data_store = {
             "aliases": {},  # node_id: "自定义名称"
             "groups": [],   # 升级为列表结构: [{"id": "uuid", "name": "...", "parent_id": None, "nodes": [...]}, ...]
@@ -81,8 +83,21 @@ class PersistenceManager:
         if not loaded:
             global_logger.info(f"{self.data_file} not found. A new one will be created upon saving.")
 
+    @contextmanager
+    def batch_mode(self):
+        """批量操作上下文：期间所有 save() 调用被抑制，退出时统一保存一次"""
+        self._batch_count += 1
+        try:
+            yield
+        finally:
+            self._batch_count -= 1
+            if self._batch_count == 0:
+                self.save()
+
     def save(self):
         """原子写入：先写临时文件再替换，防止断电导致文件损坏"""
+        if self._batch_count > 0:
+            return  # 批量模式下跳过，等 batch_mode 退出时统一保存
         os.makedirs(os.path.dirname(self.data_file) or '.', exist_ok=True)
         tmp_file = self.data_file + ".tmp"
         try:

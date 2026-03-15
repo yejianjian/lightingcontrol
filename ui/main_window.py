@@ -28,7 +28,7 @@ from core.group_scheduler import GroupScheduler
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("灯光自动控制系统 V1.2.0beta")
+        self.setWindowTitle("灯光自动控制系统 V1.2.1beta")
         # 宽屏比例适配
         self.resize(1100, 750)
         
@@ -148,7 +148,7 @@ class MainWindow(QMainWindow):
         self.clock_timer.start(1000)
 
     def _on_refresh_timer(self):
-        if not hasattr(self.dm, 'dirty_nodes') or (not self.dm.dirty_nodes and getattr(self.dm, 'structure_changed', False) == False):
+        if not hasattr(self.dm, 'dirty_nodes') or (not self.dm.dirty_nodes and not getattr(self.dm, 'structure_changed', False)):
             return
 
         # 获取仪表盘统计数据
