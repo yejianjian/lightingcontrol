@@ -2,24 +2,40 @@
   "aliases": {
     "i=24303": "PasswordOptions"
   },
-  "groups": {
-    "1": [
-      "i=2267",
-      "i=17634",
-      "i=2271",
-      "i=2736"
-    ],
-    "2": [
-      "i=12885",
-      "i=2736",
-      "i=15415"
-    ]
-  },
+  "groups": [
+    {
+      "id": "aa3f3552-ac22-47b2-a0cc-7cb326592df7",
+      "name": "1",
+      "parent_id": null,
+      "nodes": [
+        "i=2267",
+        "i=17634",
+        "i=2271",
+        "i=2736"
+      ]
+    },
+    {
+      "id": "82aa9d1d-0920-4dca-a5fa-db176828b645",
+      "name": "4",
+      "parent_id": null,
+      "nodes": [
+        "i=12885",
+        "i=2736",
+        "i=15415"
+      ]
+    },
+    {
+      "id": "56edca54-05f9-4af7-9059-2fdf1addae2b",
+      "name": "43",
+      "parent_id": "82aa9d1d-0920-4dca-a5fa-db176828b645",
+      "nodes": []
+    }
+  ],
   "schedules": [
     {
       "id": "bf1291e2-065a-4bba-b240-2b286bc35184",
       "group": "2",
-      "time": "10:01",
+      "time": "23:02",
       "weekdays": [
         0,
         1,
@@ -28,8 +44,9 @@
         5,
         6
       ],
-      "action": true,
-      "enabled": true
+      "action": false,
+      "enabled": true,
+      "group_id": "82aa9d1d-0920-4dca-a5fa-db176828b645"
     },
     {
       "id": "52fa00be-d6fe-4b6a-810b-674a506de32a",
@@ -40,6 +57,39 @@
         5
       ],
       "action": true,
+      "enabled": false,
+      "group_id": "aa3f3552-ac22-47b2-a0cc-7cb326592df7"
+    },
+    {
+      "id": "548d6468-1c25-4810-b5dc-7b3262b2e8ce",
+      "group_id": "56edca54-05f9-4af7-9059-2fdf1addae2b",
+      "time": "23:48",
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "action": true,
+      "enabled": true
+    },
+    {
+      "id": "97a56f53-6b38-44a3-9b39-16acb1c1c71b",
+      "group_id": "82aa9d1d-0920-4dca-a5fa-db176828b645",
+      "time": "21:48",
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "action": false,
       "enabled": true
     }
   ]

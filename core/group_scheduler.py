@@ -89,29 +89,43 @@ class GroupScheduler:
                             
                     last_triggered_time = current_time_key
                 
-                # 若连接正常且有未决任务，则执行补偿并且在成功后移除
+                # 若连接正常且有未决任务，则分配后台异步补偿任务
                 if self.engine.connected and self.pending_actions:
-                    completed_indices = []
-                    for idx, action_pkg in enumerate(self.pending_actions):
+                    expired_pkgs = []
+                    for action_pkg in self.pending_actions:
+                        if action_pkg.get("processing"):
+                            continue  # 防止重复派发
+                            
                         ts_str = action_pkg["timestamp"].strftime("%H:%M:%S")
                         g_id = action_pkg["group_id"]
                         g_obj = self.dm.pm.get_group_by_id(g_id)
                         g_display = g_obj.get("name") if g_obj else g_id
+                        
                         # 检查是否过期 (超时 10 分钟作废)
                         if (now - action_pkg["timestamp"]).total_seconds() > 600:
                             global_logger.warning(f"Recovery: Discarded expired (10min+) pending task for group '{g_display}' (originally at {ts_str})")
-                            completed_indices.append(idx)
+                            expired_pkgs.append(action_pkg)
                         else:
-                            global_logger.info(f"Recovery: Executing missed task for group '{g_display}' (originally at {ts_str})")
-                            try:
-                                await self._execute_group_action(g_id, action_pkg["action"], is_recovery=True)
-                                completed_indices.append(idx)  # 仅在执行成功后标记移除
-                            except Exception as e:
-                                global_logger.error(f"Recovery execution failed for group '{g_display}': {e}")
+                            global_logger.info(f"Recovery: Async dispatch for missed task for group '{g_display}' (originally at {ts_str})")
+                            action_pkg["processing"] = True
+                            
+                            async def _do_recover(pkg, name_disp):
+                                try:
+                                    await self._execute_group_action(pkg["group_id"], pkg["action"], is_recovery=True)
+                                    if pkg in self.pending_actions:
+                                        self.pending_actions.remove(pkg)
+                                except Exception as e:
+                                    pkg["processing"] = False
+                                    global_logger.error(f"Recovery execution failed for group '{name_disp}': {e}")
+                                    
+                            asyncio.create_task(_do_recover(action_pkg, g_display))
                     
-                    # 倒序移除已完成的任务，避免索引偏移
-                    for idx in reversed(completed_indices):
-                        self.pending_actions.pop(idx)
+                    # 立即移除已过期任务
+                    for pkg in expired_pkgs:
+                        try:
+                            self.pending_actions.remove(pkg)
+                        except ValueError:
+                            pass
                     
             except asyncio.CancelledError:
                 break

@@ -55,8 +55,17 @@ class MainWindow(QMainWindow):
         self.scheduler = GroupScheduler(self.dm, self.opc_engine)
         
         self._setup_ui()
+        self._apply_qss()
         self._bind_events()
         global_logger.info("MainWindow initialized with QTabWidget architecture.")
+
+    def _apply_qss(self):
+        import os, sys
+        base_path = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.dirname(__file__))
+        qss_path = os.path.join(base_path, "ui", "style.qss")
+        if os.path.exists(qss_path):
+            with open(qss_path, "r", encoding="utf-8") as f:
+                self.setStyleSheet(f.read())
 
     def _setup_ui(self):
         central_widget = QWidget()
@@ -66,20 +75,29 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
 
         # ==========================================
-        # 顶部：状态仪表盘 Dashboard
+        # 顶部：Header
+        # ==========================================
+        header_layout = QHBoxLayout()
+        lbl_greeting = QLabel("你好，Admin 👋")
+        lbl_greeting.setStyleSheet("font-size: 24px; font-weight: bold; color: #0f172a;")
+        header_layout.addWidget(lbl_greeting)
+        header_layout.addStretch()
+        main_layout.addLayout(header_layout)
+
+        # ==========================================
+        # 仪表盘 Dashboard
         # ==========================================
         dash_layout = QHBoxLayout()
         
-        self.lbl_dash_total = self._create_dash_panel("总点位数: 0")
-        self.lbl_dash_on = self._create_dash_panel("开启: 0", color="green")
-        self.lbl_dash_off = self._create_dash_panel("关闭: 0", color="black")
-        
-        self.lbl_dash_mode = self._create_dash_panel("系统状态 (待连接)", color="gray", bg_color="#E0E0E0")
+        self.card_dash_total = self._create_dash_panel("总点位数", "0")
+        self.card_dash_on = self._create_dash_panel("当前开启", "0", value_color="#10b981")
+        self.card_dash_off = self._create_dash_panel("当前关闭", "0", value_color="#64748b")
+        self.card_dash_mode = self._create_dash_panel("系统状态", "待连接", value_color="#f59e0b")
 
-        dash_layout.addWidget(self.lbl_dash_total, 1)
-        dash_layout.addWidget(self.lbl_dash_on, 1)
-        dash_layout.addWidget(self.lbl_dash_off, 1)
-        dash_layout.addWidget(self.lbl_dash_mode, 2)
+        dash_layout.addWidget(self.card_dash_total, 1)
+        dash_layout.addWidget(self.card_dash_on, 1)
+        dash_layout.addWidget(self.card_dash_off, 1)
+        dash_layout.addWidget(self.card_dash_mode, 1)
 
         main_layout.addLayout(dash_layout)
 
@@ -110,7 +128,7 @@ class MainWindow(QMainWindow):
         # 底部实时时钟
         self.lbl_clock = QLabel()
         self.lbl_clock.setAlignment(Qt.AlignCenter)
-        self.lbl_clock.setStyleSheet("background-color: #1e293b; color: #94a3b8; padding: 4px; font-size: 13px; border-radius: 3px;")
+        self.lbl_clock.setObjectName("BottomClock")
         main_layout.addWidget(self.lbl_clock)
         self._update_clock()  # 立即显示一次
 
@@ -120,21 +138,27 @@ class MainWindow(QMainWindow):
         weekday_str = weekdays[now.weekday()]
         self.lbl_clock.setText(f"🕒 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')} {weekday_str}")
 
-    def _create_dash_panel(self, text, color="black", bg_color="white"):
-        lbl = QLabel(text)
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet(f"""
-            QLabel {{
-                background-color: {bg_color};
-                color: {color};
-                border: 1px solid #CCCCCC;
-                border-radius: 4px;
-                padding: 10px;
-                font-weight: bold;
-                font-size: 14px;
-            }}
-        """)
-        return lbl
+    def _create_dash_panel(self, title, init_value, title_color="#64748b", value_color="#0f172a"):
+        card = QFrame()
+        card.setObjectName("DashboardCard")
+        
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(4)
+        
+        lbl_title = QLabel(title)
+        lbl_title.setObjectName("DashTitleLabel")
+        
+        lbl_value = QLabel(init_value)
+        lbl_value.setObjectName("DashValueLabel")
+        if value_color != "#0f172a":
+            lbl_value.setStyleSheet(f"color: {value_color};")
+            
+        layout.addWidget(lbl_title)
+        layout.addWidget(lbl_value)
+        
+        card.value_label = lbl_value
+        return card
 
     def _bind_events(self):
         # 绑定定时器处理UI的防抖/批处理刷新，解决单点高频上报造成的重绘卡顿
@@ -153,20 +177,12 @@ class MainWindow(QMainWindow):
         if not dirty_nodes and not self.dm.structure_changed:
             return
 
-        # 获取仪表盘统计数据
+        # 获取仪表盘统计数据 (直接读取 O(1) 计数器)
         total = len(self.dm.nodes)
-        on_count = 0
-        off_count = 0
-        for n in self.dm.nodes.values():
-            val = n.get('value')
-            if val is True:
-                on_count += 1
-            elif val is False:
-                off_count += 1
 
-        self.lbl_dash_total.setText(f"总点位数: {total}")
-        self.lbl_dash_on.setText(f"开启: {on_count}")
-        self.lbl_dash_off.setText(f"关闭: {off_count}")
+        self.card_dash_total.value_label.setText(str(total))
+        self.card_dash_on.value_label.setText(str(self.dm.on_count))
+        self.card_dash_off.value_label.setText(str(self.dm.off_count))
 
         # 判断是对可视区域做增量渲染，还是由于结构改变做了整体重新构建
         if self.dm.structure_changed:

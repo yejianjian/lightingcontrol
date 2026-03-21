@@ -217,7 +217,14 @@ class PersistenceManager:
     # --- Schedule API (调度器预留) ---
     def get_schedules(self):
         return self.data_store.get("schedules", [])
-        
+
+    def get_schedule_by_id(self, sched_id):
+        schedules = self.data_store.get("schedules", [])
+        for s in schedules:
+            if s.get("id") == sched_id:
+                return s
+        return None
+
     def add_schedule(self, schedule_dict):
         """传入字典包含: id, group_id, time(HH:MM), action(bool), enabled"""
         if "schedules" not in self.data_store:

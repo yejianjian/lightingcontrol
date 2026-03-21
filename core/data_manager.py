@@ -13,10 +13,12 @@ class DataManager:
         self.pm = persistence_manager
         self.aliases = self.pm.get_all_aliases()
 
-        # 脏标记缓冲队列（用于防抖防卡死）
         self._dirty_nodes: Set[str] = set()
         self._dirty_lock = asyncio.Lock()
         self.structure_changed = False
+        
+        self.on_count = 0
+        self.off_count = 0
 
     def update_node(self, node_id: str, new_data: dict):
         # 过滤掉 asyncua 底层 Node 对象引用，避免存入数据总线导致 GC 无法回收
@@ -35,8 +37,29 @@ class DataManager:
             self.nodes[node_id] = filtered_data
             self.nodes[node_id]['alias'] = self.aliases.get(node_id, filtered_data.get('name', ''))
             self.structure_changed = True
+            
+            # 首次记录值以初始化计数器
+            new_val = filtered_data.get('value')
+            if new_val is True:
+                self.on_count += 1
+            elif new_val is False:
+                self.off_count += 1
         else:
+            old_val = self.nodes[node_id].get('value')
             self.nodes[node_id].update(filtered_data)
+            new_val = self.nodes[node_id].get('value')
+            
+            # 使用 O(1) 状态机更迭计数器
+            if old_val is not new_val:
+                if old_val is True:
+                    self.on_count -= 1
+                elif old_val is False:
+                    self.off_count -= 1
+                    
+                if new_val is True:
+                    self.on_count += 1
+                elif new_val is False:
+                    self.off_count += 1
 
         self._dirty_nodes.add(node_id)
 
@@ -50,6 +73,8 @@ class DataManager:
         """清空所有节点数据，用于断线时释放过期引用"""
         self.nodes.clear()
         self._dirty_nodes.clear()
+        self.on_count = 0
+        self.off_count = 0
         self.structure_changed = True
 
     def set_alias(self, node_id: str, alias: str):

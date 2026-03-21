@@ -43,7 +43,6 @@ class TabSettings(QWidget):
         btn_layout = QHBoxLayout()
         self.btn_connect = QPushButton("连接并挂载服务器节点")
         self.btn_connect.setMinimumHeight(40)
-        self.btn_connect.setStyleSheet("font-weight: bold;")
         self.btn_connect.clicked.connect(self.on_connect_clicked)
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_connect)
@@ -121,12 +120,12 @@ class TabSettings(QWidget):
                 main_win.scheduler.start()
             
             self.btn_connect.setText("断开服务器连接")
-            self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+            self.btn_connect.setStyleSheet("color: #ef4444;")
             
             # 通知主界面连接成功更变模式指示
-            if hasattr(self.window(), 'lbl_dash_mode'):
-                self.window().lbl_dash_mode.setText(f"系统状态 (已连接: {self.engine.host})")
-                self.window().lbl_dash_mode.setStyleSheet("background-color: #8C9EFF; color: white; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+            if hasattr(self.window(), 'card_dash_mode'):
+                self.window().card_dash_mode.value_label.setText(f"已连接: {self.engine.host}")
+                self.window().card_dash_mode.value_label.setStyleSheet("color: #10b981;")
 
         except Exception as e:
             global_logger.error(f"Connection flow failed: {e}", exc_info=True)
@@ -145,15 +144,14 @@ class TabSettings(QWidget):
         
         self._is_reconnecting = True
         
-        # 使用 QTimer.singleShot(0, ...) 确保 UI 操作和 asyncio 任务创建始终在主线程执行
         def _update_ui_and_start_reconnect():
-            if hasattr(self.window(), 'lbl_dash_mode'):
-                self.window().lbl_dash_mode.setText("系统状态 (连接断开，尝试重连中...)")
-                self.window().lbl_dash_mode.setStyleSheet("background-color: #ffccc7; color: #cf1322; border: 1px solid #ffa39e; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+            if hasattr(self.window(), 'card_dash_mode'):
+                self.window().card_dash_mode.value_label.setText("断开并重连中...")
+                self.window().card_dash_mode.value_label.setStyleSheet("color: #ef4444;")
                 
             self.btn_connect.setEnabled(True)
             self.btn_connect.setText("停止自动重连")
-            self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
+            self.btn_connect.setStyleSheet("color: #ef4444;")
             
             # 在主线程的事件循环中创建异步任务，避免跨线程 RuntimeError
             asyncio.create_task(self._auto_reconnect_loop())
@@ -187,10 +185,10 @@ class TabSettings(QWidget):
                         main_win.scheduler.start()
                     
                     self.btn_connect.setText("断开服务器连接")
-                    self.btn_connect.setStyleSheet("font-weight: bold; color: red;")
-                    if hasattr(self.window(), 'lbl_dash_mode'):
-                        self.window().lbl_dash_mode.setText(f"系统状态 (已连接: {self.engine.host})")
-                        self.window().lbl_dash_mode.setStyleSheet("background-color: #8C9EFF; color: white; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+                    self.btn_connect.setStyleSheet("color: #ef4444;")
+                    if hasattr(self.window(), 'card_dash_mode'):
+                        self.window().card_dash_mode.value_label.setText(f"已连接: {self.engine.host}")
+                        self.window().card_dash_mode.value_label.setStyleSheet("color: #10b981;")
                     
                     self._is_reconnecting = False
                     break
@@ -198,8 +196,8 @@ class TabSettings(QWidget):
                     global_logger.error(f"Auto-reconnect failed: {e}")
                     if getattr(self, '_is_reconnecting', False):
                         self.btn_connect.setText("停止自动重连 (下次在15秒后...)")
-                        if hasattr(self.window(), 'lbl_dash_mode'):
-                             self.window().lbl_dash_mode.setText("系统状态 (重连失败，定时重试中...)")
+                        if hasattr(self.window(), 'card_dash_mode'):
+                             self.window().card_dash_mode.value_label.setText("定时重试中...")
         finally:
             if not self.engine.connected and not getattr(self, '_is_reconnecting', False):
                 pass
@@ -211,9 +209,9 @@ class TabSettings(QWidget):
         self.dm.clear_nodes()
         self.btn_connect.setText("连接并挂载服务器节点")
         self.btn_connect.setEnabled(True)
-        self.btn_connect.setStyleSheet("font-weight: bold;")
+        self.btn_connect.setStyleSheet("")
         # 恢复 Dashboard 状态
-        if hasattr(self.window(), 'lbl_dash_mode'):
-            self.window().lbl_dash_mode.setText("系统状态 (待连接)")
-            self.window().lbl_dash_mode.setStyleSheet("background-color: #E0E0E0; color: gray; border: 1px solid #CCCCCC; border-radius: 4px; padding: 10px; font-weight: bold; font-size: 14px;")
+        if hasattr(self.window(), 'card_dash_mode'):
+            self.window().card_dash_mode.value_label.setText("待连接")
+            self.window().card_dash_mode.value_label.setStyleSheet("color: #f59e0b;")
         global_logger.info("Disconnected from OPC Server.")

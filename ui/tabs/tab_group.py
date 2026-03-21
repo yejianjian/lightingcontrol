@@ -1,11 +1,13 @@
 try:
-    from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox, QTreeWidget, QTreeWidgetItem)
-    from PyQt5.QtCore import Qt, QTime
+    from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                                 QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox, QTreeWidget, QTreeWidgetItem, QSplitter, QDialog)
+    from PyQt5.QtCore import Qt, QTime, QAbstractTableModel, QModelIndex, QSortFilterProxyModel
+    from PyQt5.QtGui import QColor, QFont
 except ImportError:
-    from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                                 QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox, QTreeWidget, QTreeWidgetItem)
-    from PySide6.QtCore import Qt, QTime
+    from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                                 QGroupBox, QTableView, QHeaderView, QLabel, QComboBox, QInputDialog, QMessageBox, QAbstractItemView, QLineEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QFileDialog, QCheckBox, QTreeWidget, QTreeWidgetItem, QSplitter, QDialog)
+    from PySide6.QtCore import Qt, QTime, QAbstractTableModel, QModelIndex, QSortFilterProxyModel
+    from PySide6.QtGui import QColor, QFont
     
 import uuid
 import asyncio
@@ -13,7 +15,93 @@ import re
 import pandas as pd
 from utils.logger import global_logger
 from utils.filter_helper import filter_nodes
-from ui.tabs.tab_monitor import MonitorTableModel
+
+class SearchProxyModel(QSortFilterProxyModel):
+    def __init__(self):
+        super().__init__()
+        self.keyword = ""
+        self.type_filter = "全部类型"
+    
+    def set_filter(self, keyword, type_filter):
+        self.keyword = keyword.lower()
+        self.type_filter = type_filter
+        self.invalidateFilter()
+        
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        if not model: return False
+        
+        # Keyword matches Name (col 0) or NodeID (col 2)
+        match_kw = True
+        if self.keyword:
+            name_idx = model.index(source_row, 0, source_parent)
+            node_idx = model.index(source_row, 2, source_parent)
+            name_val = str(model.data(name_idx) or "").lower()
+            node_val = str(model.data(node_idx) or "").lower()
+            match_kw = (self.keyword in name_val) or (self.keyword in node_val)
+            
+        # Type matches (col 3)
+        match_type = True
+        if self.type_filter != "全部类型":
+            type_idx = model.index(source_row, 3, source_parent)
+            type_val = str(model.data(type_idx) or "")
+            match_type = (self.type_filter in type_val)
+            
+        return match_kw and match_type
+
+class GroupMemberTableModel(QAbstractTableModel):
+    """组内/组外控制点表格模型，仅显示4列：别名、当前状态、Node ID、数据类型"""
+    def __init__(self, data_manager):
+        super().__init__()
+        self.dm = data_manager
+        self._data_cache = []
+        self._headers = ["别名", "当前状态", "Node ID", "数据类型"]
+
+    def set_data(self, nodes):
+        self.beginResetModel()
+        self._data_cache = nodes
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._data_cache)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self._headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._data_cache)):
+            return None
+
+        node = self._data_cache[index.row()]
+        col = index.column()
+
+        if role == Qt.DisplayRole:
+            if col == 0: return node.get('alias', node.get('name', ''))
+            if col == 1:
+                val = node.get('value')
+                if isinstance(val, bool): return "开启" if val else "关闭"
+                return str(val) if val is not None else "等待更新"
+            if col == 2: return node.get('node_id', '')
+            if col == 3: return node.get('type', '')
+        elif role == Qt.ForegroundRole:
+            if col == 1:
+                val = node.get('value')
+                if isinstance(val, bool):
+                    return QColor("red") if not val else QColor("green")
+        elif role == Qt.FontRole:
+            if col == 1:
+                font = QFont()
+                font.setBold(True)
+                return font
+        elif role == Qt.TextAlignmentRole:
+            return Qt.AlignCenter
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
 
 class TabGroup(QWidget):
     def __init__(self, data_manager, opc_engine):
@@ -23,127 +111,155 @@ class TabGroup(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        main_layout = QHBoxLayout(self)
-        
+        # 使用 QSplitter 实现左右可调节布局
+        main_splitter = QSplitter(Qt.Horizontal)
+
         # ===============================
         # 左侧：分组列表管理
         # ===============================
-        left_layout = QVBoxLayout()
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
         grp_group = QGroupBox("分组管理")
         grp_group_layout = QVBoxLayout(grp_group)
-        
+
         btn_layout = QHBoxLayout()
         self.btn_add_group = QPushButton("新建一级分组")
         self.btn_add_sub = QPushButton("新建子分组")
         self.btn_rename_group = QPushButton("重命名")
         self.btn_del_group = QPushButton("删除分组")
-        self.btn_del_group.setStyleSheet("QPushButton {background-color: #ff4d4f; color: white;} QPushButton:hover {background-color: #ff7875;} QPushButton:pressed {background-color: #d9363e;}")
-        
+        self.btn_del_group.setStyleSheet("QPushButton {background-color: #fee2e2; color: #ef4444; border: 1px solid #fca5a5; border-radius: 6px;} QPushButton:hover {background-color: #fecaca;}")
+
         btn_layout_io = QHBoxLayout()
         self.btn_export_group = QPushButton("导出配置")
         self.btn_import_group = QPushButton("导入配置")
         btn_layout_io.addWidget(self.btn_export_group)
         btn_layout_io.addWidget(self.btn_import_group)
-        
+
         btn_layout.addWidget(self.btn_add_group)
         btn_layout.addWidget(self.btn_add_sub)
         btn_layout.addWidget(self.btn_rename_group)
         btn_layout.addWidget(self.btn_del_group)
-        
+
         self.tree_groups = QTreeWidget()
         self.tree_groups.setHeaderLabel("照明分组架构 (三级)")
-        
+
         # 批量控制区（底部）
         batch_layout = QVBoxLayout()
         batch_layout.addWidget(QLabel("【勾选组】批量控制:"))
         keys_layout = QHBoxLayout()
         self.btn_batch_on = QPushButton("⚡ 批量全开")
         self.btn_batch_on.setStyleSheet(
-            "QPushButton {background-color: #52c41a; color: white; height: 40px; font-weight: bold; border-radius: 4px;}"
-            "QPushButton:hover {background-color: #73d13d;}"
-            "QPushButton:pressed {background-color: #389e0d;}"
+            "QPushButton {background-color: #10b981; color: white; height: 40px; font-weight: bold; border-radius: 6px; border: none;}"
+            "QPushButton:hover {background-color: #34d399;}"
+            "QPushButton:pressed {background-color: #059669;}"
         )
         self.btn_batch_off = QPushButton("💡 批量全关")
         self.btn_batch_off.setStyleSheet(
-            "QPushButton {background-color: #f5222d; color: white; height: 40px; font-weight: bold; border-radius: 4px;}"
-            "QPushButton:hover {background-color: #ff7875;}"
-            "QPushButton:pressed {background-color: #d9363e;}"
+            "QPushButton {background-color: #ef4444; color: white; height: 40px; font-weight: bold; border-radius: 6px; border: none;}"
+            "QPushButton:hover {background-color: #f87171;}"
+            "QPushButton:pressed {background-color: #dc2626;}"
         )
         keys_layout.addWidget(self.btn_batch_on)
         keys_layout.addWidget(self.btn_batch_off)
         batch_layout.addLayout(keys_layout)
-        
+
         grp_group_layout.addLayout(btn_layout)
         grp_group_layout.addLayout(btn_layout_io)
         grp_group_layout.addWidget(self.tree_groups)
         grp_group_layout.addLayout(batch_layout)
-        
+
         left_layout.addWidget(grp_group)
-        
+
         # ===============================
-        # 右侧：组成员管理 & 定时调度
+        # 右侧：组成员管理 & 定时调度（使用 QSplitter 上下可调节）
         # ===============================
-        right_layout = QVBoxLayout()
-        
-        # 右上：成员穿梭框
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        # 上下分割器：成员管理 / 定时调度
+        vert_splitter = QSplitter(Qt.Vertical)
+
+        # 上部：成员穿梭框
         grp_members = QGroupBox("组成员管理 (选中分组后配置)")
-        members_layout = QHBoxLayout(grp_members)
-        
-        # 左穿梭（选中的组成员）
+        members_layout = QVBoxLayout(grp_members)
+
+        # 左穿梭（选中的组成员）- 带筛选
         box_in = QVBoxLayout()
-        box_in.addWidget(QLabel("组内控制点 (点击移出):"))
+        header_in = QHBoxLayout()
+        header_in.addWidget(QLabel("组内控制点 (点击移出):"))
+        header_in.addStretch()
+        header_in.addWidget(QLabel("类型:"))
+        self.cb_type_in = QComboBox()
+        self.cb_type_in.addItems(["全部类型", "Boolean", "UInt", "Int", "Real", "String"])
+        self.cb_type_in.currentTextChanged.connect(lambda _: self._update_in_filter())
+        header_in.addWidget(self.cb_type_in)
+        header_in.addWidget(QLabel(" 搜索:"))
+        self.le_search_in = QLineEdit()
+        self.le_search_in.setPlaceholderText("搜ID或别名...")
+        self.le_search_in.textChanged.connect(lambda _: self._update_in_filter())
+        header_in.addWidget(self.le_search_in)
+        box_in.addLayout(header_in)
+
         self.tb_in = QTableView()
+        self.tb_in.setSelectionBehavior(QAbstractItemView.SelectRows)
         box_in.addWidget(self.tb_in)
-        
-        # 右穿梭（可供添加的成员）
+
+        # 右穿梭（可供添加的成员）- 带筛选
         box_out = QVBoxLayout()
         header_out = QHBoxLayout()
         header_out.addWidget(QLabel("可添加控制点 (点击加入):"))
         header_out.addStretch()
-        header_out.addWidget(QLabel("筛选类型:"))
-        self.cb_type = QComboBox()
-        self.cb_type.addItems(["全部类型", "Boolean", "UInt", "Int", "Real", "String"])
-        self.cb_type.currentTextChanged.connect(self.refresh_members)
-        header_out.addWidget(self.cb_type)
-        
+        header_out.addWidget(QLabel("类型:"))
+        self.cb_type_out = QComboBox()
+        self.cb_type_out.addItems(["全部类型", "Boolean", "UInt", "Int", "Real", "String"])
+        self.cb_type_out.currentTextChanged.connect(lambda _: self._update_out_filter())
+        header_out.addWidget(self.cb_type_out)
+
         header_out.addWidget(QLabel(" 搜索:"))
-        self.le_search = QLineEdit()
-        self.le_search.setPlaceholderText("搜ID或别名...")
-        self.le_search.textChanged.connect(self.refresh_members)
-        header_out.addWidget(self.le_search)
-        
+        self.le_search_out = QLineEdit()
+        self.le_search_out.setPlaceholderText("搜ID或别名...")
+        self.le_search_out.textChanged.connect(lambda _: self._update_out_filter())
+        header_out.addWidget(self.le_search_out)
+
         box_out.addLayout(header_out)
-        
+
         self.tb_out = QTableView()
+        self.tb_out.setSelectionBehavior(QAbstractItemView.SelectRows)
         box_out.addWidget(self.tb_out)
-        
-        members_layout.addLayout(box_in)
-        members_layout.addLayout(box_out)
-        
-        # 右下：定时调度
+
+        # 左右分割器
+        horiz_splitter = QSplitter(Qt.Horizontal)
+        horiz_splitter.addWidget(self._make_widget_from_layout(box_in))
+        horiz_splitter.addWidget(self._make_widget_from_layout(box_out))
+        horiz_splitter.setStretchFactor(0, 1)
+        horiz_splitter.setStretchFactor(1, 1)
+
+        members_layout.addWidget(horiz_splitter)
+
+        # 下部：定时调度
         grp_schedule = QGroupBox("自动定时控制 (对勾选的多个组生效)")
         sched_layout = QVBoxLayout(grp_schedule)
-        
+
         ctrl_layout = QHBoxLayout()
         ctrl_layout.addWidget(QLabel("时间:"))
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("HH:mm")
         self.time_edit.setTime(QTime.currentTime())
         ctrl_layout.addWidget(self.time_edit)
-        
+
         ctrl_layout.addWidget(QLabel(" 动作:"))
         self.cb_action = QComboBox()
         self.cb_action.addItems(["开启", "关闭"])
         ctrl_layout.addWidget(self.cb_action)
-        
+
         self.btn_add_sched = QPushButton("增加计划")
         self.btn_del_sched = QPushButton("删除选中")
-        self.btn_del_sched.setStyleSheet("QPushButton {color: #ff4d4f;} QPushButton:hover {color: #ff7875;}")
+        self.btn_del_sched.setStyleSheet("QPushButton {color: #ef4444; background-color: transparent;} QPushButton:hover {background-color: #fee2e2;}")
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.btn_add_sched)
         ctrl_layout.addWidget(self.btn_del_sched)
         sched_layout.addLayout(ctrl_layout)
-        
+
         # 星期复选框列
         week_layout = QHBoxLayout()
         week_layout.addWidget(QLabel(" 重复:"))
@@ -151,13 +267,13 @@ class TabGroup(QWidget):
         days = ["一", "二", "三", "四", "五", "六", "日"]
         for i, day in enumerate(days):
             cb = QCheckBox(day)
-            cb.setChecked(True) # 默认全选
+            cb.setChecked(True)  # 默认全选
             cb.setMinimumWidth(40)
             self.week_checkboxes.append(cb)
             week_layout.addWidget(cb)
         week_layout.addStretch()
         sched_layout.addLayout(week_layout)
-        
+
         self.table_sched = QTableWidget()
         self.table_sched.setColumnCount(6)
         self.table_sched.setHorizontalHeaderLabels(["ID", "目标分组", "触发时间", "重复日期", "动作指令", "状态"])
@@ -166,36 +282,49 @@ class TabGroup(QWidget):
         header_sched.setStretchLastSection(True)
         self.table_sched.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_sched.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table_sched.hideColumn(0) # 隐藏内部ID
+        self.table_sched.hideColumn(0)  # 隐藏内部ID
         sched_layout.addWidget(self.table_sched)
+
+        vert_splitter.addWidget(grp_members)
+        vert_splitter.addWidget(grp_schedule)
+        vert_splitter.setStretchFactor(0, 6)
+        vert_splitter.setStretchFactor(1, 4)
+
+        right_layout.addWidget(vert_splitter)
+
+        # 组装左右分割器
+        main_splitter.addWidget(left_widget)
+        main_splitter.addWidget(right_widget)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 7)
+
+        # 设置主窗口布局
+        container = QWidget()
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(main_splitter)
+        self.setLayout(container_layout)
+
+        # 使用新的 GroupMemberTableModel
+        self.model_in = GroupMemberTableModel(self.dm)
+        self.model_out = GroupMemberTableModel(self.dm)
         
-        right_layout.addWidget(grp_members, 6) # 占比6
-        right_layout.addWidget(grp_schedule, 4) # 占比4
+        self.proxy_in = SearchProxyModel()
+        self.proxy_in.setSourceModel(self.model_in)
+        self.proxy_out = SearchProxyModel()
+        self.proxy_out.setSourceModel(self.model_out)
         
-        # 装入全局
-        main_layout.addLayout(left_layout, 3) # 左边占3
-        main_layout.addLayout(right_layout, 7) # 右边占7
-        
-        self.model_in = MonitorTableModel(self.dm)
-        self.model_out = MonitorTableModel(self.dm)
-        self.tb_in.setModel(self.model_in)
-        self.tb_out.setModel(self.model_out)
-        
-        self.tb_in.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tb_out.setSelectionBehavior(QAbstractItemView.SelectRows)
-        
+        self.tb_in.setModel(self.proxy_in)
+        self.tb_out.setModel(self.proxy_out)
+
         self.tb_in.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.tb_in.horizontalHeader().setStretchLastSection(True)
         self.tb_out.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.tb_out.horizontalHeader().setStretchLastSection(True)
-        
-        # 隐藏控制操作列
-        self.tb_in.hideColumn(5)
-        self.tb_out.hideColumn(5)
-        
+
         self.tb_in.doubleClicked.connect(self.on_move_out)
         self.tb_out.doubleClicked.connect(self.on_move_in)
-        
+
         # 绑定左侧群组信号
         self.btn_add_group.clicked.connect(lambda: self.on_add_group(is_sub=False))
         self.btn_add_sub.clicked.connect(lambda: self.on_add_group(is_sub=True))
@@ -204,15 +333,35 @@ class TabGroup(QWidget):
         self.btn_export_group.clicked.connect(self.on_export_groups)
         self.btn_import_group.clicked.connect(self.on_import_groups)
         self.tree_groups.currentItemChanged.connect(self.on_group_selection_changed)
-        
+
         self.btn_batch_on.clicked.connect(lambda: self.on_batch_control(True))
         self.btn_batch_off.clicked.connect(lambda: self.on_batch_control(False))
-        
+
         self.btn_add_sched.clicked.connect(self.on_add_schedule)
         self.btn_del_sched.clicked.connect(self.on_del_schedule)
-        
+        self.table_sched.cellDoubleClicked.connect(self.on_schedule_cell_double_clicked)
+
         self.refresh_groups_list()
         self.refresh_schedules()
+
+    def _make_widget_from_layout(self, layout):
+        """将布局转换为 widget"""
+        w = QWidget()
+        w.setLayout(layout)
+        return w
+
+    def _update_in_filter(self):
+        self.proxy_in.set_filter(self.le_search_in.text(), self.cb_type_in.currentText())
+
+    def _update_out_filter(self):
+        self.proxy_out.set_filter(self.le_search_out.text(), self.cb_type_out.currentText())
+
+    def _get_schedule_group_name(self, sched):
+        """从调度对象获取分组名称"""
+        if not sched:
+            return ""
+        g_obj = self.dm.pm.get_group_by_id(sched.get("group_id"))
+        return g_obj.get("name") if g_obj else sched.get("group_id", "")
 
     def refresh_groups_list(self):
         """重新构建树形分组结构"""
@@ -275,7 +424,7 @@ class TabGroup(QWidget):
     def on_add_group(self, is_sub=False):
         parent_id = None
         current_depth = 0
-        
+
         if is_sub:
             curr = self.tree_groups.currentItem()
             if not curr:
@@ -287,15 +436,16 @@ class TabGroup(QWidget):
             while temp:
                 current_depth += 1
                 temp = temp.parent()
-            
+
             if current_depth >= 3:
                 QMessageBox.warning(self, "深度限制", "分组深度最高支持 3 级（例如：区域 > 楼层 > 房间）。")
                 return
-        
+
         title = "新建子分组" if is_sub else "新建一级分组"
         text, ok = QInputDialog.getText(self, title, "请输入分组名称:")
         if ok and text.strip():
             self.dm.pm.add_group(text.strip(), parent_id)
+            global_logger.info(f"{'新建子分组' if is_sub else '新建一级分组'}: '{text.strip()}'")
             self.refresh_groups_list()
                 
     def on_del_group(self):
@@ -303,10 +453,11 @@ class TabGroup(QWidget):
         if not curr: return
         group_id = curr.data(0, Qt.UserRole)
         name = curr.text(0)
-        
+
         rep = QMessageBox.question(self, "确认", f"确定要删除分组 {name} 及其所有子分组吗？\n(仅解散分组，不影响控制节点)", QMessageBox.Yes | QMessageBox.No)
         if rep == QMessageBox.Yes:
             self.dm.pm.delete_group(group_id)
+            global_logger.info(f"删除分组: '{name}'")
             self.refresh_groups_list()
 
     def on_rename_group(self):
@@ -314,11 +465,13 @@ class TabGroup(QWidget):
         if not curr: return
         group_id = curr.data(0, Qt.UserRole)
         old_name = curr.text(0)
-        
+
         text, ok = QInputDialog.getText(self, "重命名", "请输入新分组名称:", text=old_name)
         if ok and text.strip() and text.strip() != old_name:
             if self.dm.pm.rename_group(group_id, text.strip()):
+                global_logger.info(f"分组 '{old_name}' 已重命名为 '{text.strip()}'")
                 self.refresh_groups_list()
+                self.refresh_schedules()
 
     def on_export_groups(self):
         groups = self.dm.pm.get_groups()
@@ -428,53 +581,45 @@ class TabGroup(QWidget):
                  
                  
     def on_group_selection_changed(self, current, previous):
-        if not current: 
-            self.model_in.beginResetModel()
-            self.model_in._data_cache = []
-            self.model_in.endResetModel()
-            self.model_out.beginResetModel()
-            self.model_out._data_cache = []
-            self.model_out.endResetModel()
+        if not current:
+            self.model_in.set_data([])
+            self.model_out.set_data([])
             return
-        
+
         self.refresh_members()
         
     def refresh_members(self):
         curr = self.tree_groups.currentItem()
         if not curr: return
         group_id = curr.data(0, Qt.UserRole)
-        
+
         group_obj = self.dm.pm.get_group_by_id(group_id)
         if not group_obj: return
-        
+
         # 成员穿梭框仅针对「当前特定层级」的分组，不包含子孙
         member_ids = set(group_obj.get("nodes", []))
         all_nodes = self.dm.get_node_list()
-        
+
         in_nodes = [n for n in all_nodes if n.get('node_id') in member_ids]
-        
-        # 使用公共筛选函数过滤可添加的节点
-        tf = self.cb_type.currentText()
-        kw = self.le_search.text().strip()
+
+        self.model_in.set_data(in_nodes)
         
         non_member_nodes = [n for n in all_nodes if n.get('node_id') not in member_ids]
-        out_nodes = filter_nodes(non_member_nodes, keyword=kw, type_filter=tf)
+        self.model_out.set_data(non_member_nodes)
         
-        self.model_in.beginResetModel()
-        self.model_in._data_cache = in_nodes
-        self.model_in.endResetModel()
-        
-        self.model_out.beginResetModel()
-        self.model_out._data_cache = out_nodes
-        self.model_out.endResetModel()
+        # 顺便刷新一遍过滤以处理数据源变更
+        self._update_in_filter()
+        self._update_out_filter()
 
     def on_move_in(self, index):
         curr = self.tree_groups.currentItem()
         if not curr or not index.isValid(): return
         group_id = curr.data(0, Qt.UserRole)
         
+        src_index = self.proxy_out.mapToSource(index)
+        
         try:
-            node = self.model_out._data_cache[index.row()]
+            node = self.model_out._data_cache[src_index.row()]
         except IndexError:
             return
         nid = node.get('node_id')
@@ -492,8 +637,10 @@ class TabGroup(QWidget):
         if not curr or not index.isValid(): return
         group_id = curr.data(0, Qt.UserRole)
         
+        src_index = self.proxy_in.mapToSource(index)
+        
         try:
-            node = self.model_in._data_cache[index.row()]
+            node = self.model_in._data_cache[src_index.row()]
         except IndexError:
             return
         nid = node.get('node_id')
@@ -558,8 +705,8 @@ class TabGroup(QWidget):
             batch_size = 100  # 增大批次，减少网络往返
             for i in range(0, len(member_list), batch_size):
                 batch = member_list[i:i+batch_size]
-                display_names = [self.dm.get_alias_by_node_id(nid) for nid in batch]
-                success_count, fail_count = await self.engine.write_values_batch(batch, action_val, display_names)
+                node_aliases = [self.dm.get_alias_by_node_id(nid) for nid in batch]
+                success_count, fail_count = await self.engine.write_values_batch(batch, action_val, node_aliases)
                 if fail_count > 0:
                     global_logger.error(f"批量写入部分失败: {success_count} 成功, {fail_count} 失败")
 
@@ -602,9 +749,9 @@ class TabGroup(QWidget):
             is_enabled = s.get("enabled", True)
             btn_status = QPushButton("🟢 已开启" if is_enabled else "🔴 已关闭")
             if is_enabled:
-                btn_status.setStyleSheet("QPushButton { color: white; background-color: #52c41a; border-radius: 3px; padding: 2px; } QPushButton:hover { background-color: #73d13d; }")
+                btn_status.setStyleSheet("QPushButton { color: white; background-color: #10b981; border-radius: 6px; border: none; padding: 4px; } QPushButton:hover { background-color: #34d399; }")
             else:
-                btn_status.setStyleSheet("QPushButton { color: white; background-color: #8c8c8c; border-radius: 3px; padding: 2px; } QPushButton:hover { background-color: #a6a6a6; }")
+                btn_status.setStyleSheet("QPushButton { color: white; background-color: #94a3b8; border-radius: 6px; border: none; padding: 4px; } QPushButton:hover { background-color: #cbd5e1; }")
                 
             # 闭包绑定当前id和前状态
             btn_status.clicked.connect(lambda chk, _id=s.get("id"), curr=is_enabled: self.on_toggle_schedule(_id, curr))
@@ -614,8 +761,70 @@ class TabGroup(QWidget):
     def on_toggle_schedule(self, sched_id, current_status):
         new_status = not current_status
         self.dm.pm.update_schedule(sched_id, {"enabled": new_status})
-        global_logger.info(f"调度计划 {sched_id} 用户操作变更为 -> [{'可用' if new_status else '停用'}]")
+        sched = self.dm.pm.get_schedule_by_id(sched_id)
+        group_name = self._get_schedule_group_name(sched)
+        global_logger.info(f"调度计划 '{group_name}' (ID: {sched_id}) 变更为 -> [{'可用' if new_status else '停用'}]")
         self.refresh_schedules()
+
+    def on_schedule_cell_double_clicked(self, row, col):
+        """双击调度表单元格编辑时间和动作"""
+        # 只允许编辑列2（触发时间）和列4（动作指令）
+        if col not in (2, 4):
+            return
+
+        sched_id = self.table_sched.item(row, 0).text()
+        if not sched_id:
+            return
+
+        if col == 2:
+            # 编辑时间：弹出时间选择对话框
+            current_time_str = self.table_sched.item(row, 2).text()
+            time_obj = QTime.fromString(current_time_str, "HH:mm")
+            if not time_obj.isValid():
+                time_obj = QTime.currentTime()
+
+            time_edit = QTimeEdit(time_obj)
+            time_edit.setDisplayFormat("HH:mm")
+            time_edit.setMinimumWidth(100)
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle("修改触发时间")
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(time_edit)
+            btn_box = QHBoxLayout()
+            btn_ok = QPushButton("确定")
+            btn_cancel = QPushButton("取消")
+            btn_ok.clicked.connect(dialog.accept)
+            btn_cancel.clicked.connect(dialog.reject)
+            btn_box.addStretch()
+            btn_box.addWidget(btn_ok)
+            btn_box.addWidget(btn_cancel)
+            layout.addLayout(btn_box)
+
+            if dialog.exec_() == QDialog.Accepted:
+                new_time_str = time_edit.time().toString("HH:mm")
+                self.dm.pm.update_schedule(sched_id, {"time": new_time_str})
+                sched = self.dm.pm.get_schedule_by_id(sched_id)
+                group_name = self._get_schedule_group_name(sched)
+                global_logger.info(f"调度计划 '{group_name}' (ID: {sched_id}) 时间修改为 {new_time_str}")
+                self.refresh_schedules()
+
+        elif col == 4:
+            # 编辑动作：切换开启/关闭
+            current_action_text = self.table_sched.item(row, 4).text()
+            current_action = (current_action_text == "开启")
+
+            # 弹出选择对话框
+            items = ["开启", "关闭"]
+            current_idx = 0 if current_action else 1
+            item, ok = QInputDialog.getItem(self, "修改动作指令", "选择动作:", items, current_idx, False)
+            if ok and item:
+                new_action = (item == "开启")
+                self.dm.pm.update_schedule(sched_id, {"action": new_action})
+                sched = self.dm.pm.get_schedule_by_id(sched_id)
+                group_name = self._get_schedule_group_name(sched)
+                global_logger.info(f"调度计划 '{group_name}' (ID: {sched_id}) 动作修改为 {'开启' if new_action else '关闭'}")
+                self.refresh_schedules()
 
     def on_add_schedule(self):
         checked_group_ids = self._get_checked_group_ids()
@@ -638,6 +847,7 @@ class TabGroup(QWidget):
                 weekdays.append(i)
         
         sched_list = []
+        group_names = []
         for g_id in checked_group_ids:
             sched_dict = {
                 "id": str(uuid.uuid4()),
@@ -648,18 +858,23 @@ class TabGroup(QWidget):
                 "enabled": True
             }
             sched_list.append(sched_dict)
-        
+            g_obj = self.dm.pm.get_group_by_id(g_id)
+            group_names.append(g_obj.get("name") if g_obj else g_id)
+
         # 批量添加，一次性持久化，避免 N 次磁盘 IO
         self.dm.pm.batch_add_schedules(sched_list)
-            
+        global_logger.info(f"新增调度计划: 分组 {group_names}, 时间 {time_str}, 动作 {'开启' if is_on else '关闭'}, 重复 {[i+1 for i in weekdays] if weekdays else '每天'}")
         self.refresh_schedules()
 
     def on_del_schedule(self):
         selected = self.table_sched.selectedItems()
         if not selected: return
-        
+
         row = selected[0].row()
         sched_id = self.table_sched.item(row, 0).text()
-        
+        sched = self.dm.pm.get_schedule_by_id(sched_id)
+        group_name = self._get_schedule_group_name(sched)
+
         self.dm.pm.delete_schedule(sched_id)
+        global_logger.info(f"删除调度计划: 分组 '{group_name}' (ID: {sched_id})")
         self.refresh_schedules()
