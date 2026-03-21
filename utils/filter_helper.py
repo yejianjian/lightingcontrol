@@ -31,6 +31,9 @@ def filter_nodes(all_nodes, keyword="", type_filter="全部数据类型"):
 
     allowed = TYPE_MAP.get(tf_lower, [tf_lower])
 
+    # 特殊处理 Int/UInt 区分：Int 只匹配带 int 但不带 uint 的类型
+    is_int_filter = tf_lower == 'int'
+
     filtered = []
     for n in all_nodes:
         # 类型筛检
@@ -39,8 +42,8 @@ def filter_nodes(all_nodes, keyword="", type_filter="全部数据类型"):
             matched = False
             for t in allowed:
                 if t in n_type:
-                    # 规避 Int 被 UInt 误匹配
-                    if tf_lower == 'int' and 'uint' in n_type:
+                    # 规避 Int 被 UInt 误匹配：Int 过滤器排除 uint 类型
+                    if is_int_filter and 'uint' in n_type:
                         continue
                     matched = True
                     break

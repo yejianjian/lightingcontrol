@@ -552,26 +552,17 @@ class TabGroup(QWidget):
         action_name = '全开' if action_val else '全关'
         global_logger.info(f"==> 用户点击了批量 {action_name} 操作 | 受影响的分组: {', '.join(display_names)} | 受影响总节点数: {len(combined_member_ids)}")
         
-        # 分批发送写入指令，避免瞬间压垮 OPC 服务器
+        # 方案B：使用 WriteList 批量写入，大幅减少 RTT
         async def _batch_write():
             member_list = list(combined_member_ids)
-            batch_size = 50
+            batch_size = 100  # 增大批次，减少网络往返
             for i in range(0, len(member_list), batch_size):
                 batch = member_list[i:i+batch_size]
-                tasks = []
-                for nid in batch:
-                    # 获取别名用于日志显示
-                    alias = self.dm.get_alias_by_node_id(nid)
-                    task = asyncio.create_task(self.engine.write_node_value(nid, action_val, display_name=alias))
-                    tasks.append(task)
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in results:
-                        if isinstance(r, Exception):
-                            global_logger.error(f"批量控制写入异常: {r}")
-                if i + batch_size < len(member_list):
-                    await asyncio.sleep(0.1)
-        
+                display_names = [self.dm.get_alias_by_node_id(nid) for nid in batch]
+                success_count, fail_count = await self.engine.write_values_batch(batch, action_val, display_names)
+                if fail_count > 0:
+                    global_logger.error(f"批量写入部分失败: {success_count} 成功, {fail_count} 失败")
+
         asyncio.create_task(_batch_write())
 
     def refresh_schedules(self):

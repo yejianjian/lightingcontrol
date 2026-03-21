@@ -3,6 +3,8 @@ from datetime import datetime
 from utils.logger import global_logger
 import traceback
 
+MAX_PENDING_ACTIONS = 100  # pending_actions 队列上限，防止内存泄漏
+
 class GroupScheduler:
     """
     后台常驻调度器，基于 asyncio 协程，
@@ -14,8 +16,7 @@ class GroupScheduler:
         self.running = False
         self._task = None
         self.pending_actions = [] # 元素结构: {"group_id": uuid, "action": bool, "timestamp": datetime}
-        # 并发控制：延迟初始化，避免在事件循环尚未启动时绑定 Semaphore
-        self._semaphore = None
+        self._batch_semaphore = None  # 控制批量写入并发
 
     def start(self):
         if not self.running:
@@ -45,8 +46,8 @@ class GroupScheduler:
     async def _scheduler_loop(self):
         global_logger.info("Group Scheduler background tick loop actually started running.")
         # 延迟初始化 Semaphore，确保当前事件循环已启动
-        if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(30)
+        if self._batch_semaphore is None:
+            self._batch_semaphore = asyncio.Semaphore(5)  # 限制最多5个并发批量写入
         # 使用 (hour, minute) 元组避免跨小时重复问题
         last_triggered_time = (-1, -1)
         while self.running:
@@ -132,36 +133,32 @@ class GroupScheduler:
                 )
                 if not already_queued:
                     global_logger.warning(f"Scheduler active but OPC engine is disconnected. Task for group '{group_name}' queued for recovery.")
+                    # 限制队列大小，超出则移除最旧的
+                    if len(self.pending_actions) >= MAX_PENDING_ACTIONS:
+                        removed = self.pending_actions.pop(0)
+                        global_logger.warning(f"Pending queue full, removed oldest: {removed['group_id']}")
                     self.pending_actions.append({"group_id": group_id, "action": action, "timestamp": datetime.now()})
                 else:
                     global_logger.debug(f"Duplicate pending task for '{group_name}' (ID: {group_id}) skipped.")
             return
-            
+
         # 递归获取成员（包含所有子分组的控制点）
         members = self.dm.pm.get_group_nodes_recursive(group_id)
         if not members:
              global_logger.warning(f"Scheduler active but group '{group_name}' (ID: {group_id}) is empty or has no nodes recursive.")
              return
 
-        async def _limited_write(nid, val):
-            async with self._semaphore:
-                # 获取别名用于日志显示
-                alias = self.dm.get_alias_by_node_id(nid)
-                try:
-                    success = await self.engine.write_node_value(nid, val, display_name=alias)
-                    if not success:
-                        global_logger.error(f"Scheduled write failed for node {alias}")
-                except Exception as e:
-                    global_logger.error(f"Exception during scheduled write for {alias}: {e}")
+        # 方案B：使用 WriteList 批量写入，限制并发数
+        async with self._batch_semaphore:
+            member_list = list(members)
+            batch_size = 100  # 增大批次，减少网络往返
 
-        # 分批并发执行，每批 50 个节点，批次间间隔 0.1s，避免压垮 OPC 服务器
-        member_list = list(members)
-        batch_size = 50
-        for i in range(0, len(member_list), batch_size):
-            batch = member_list[i:i+batch_size]
-            tasks = [asyncio.create_task(_limited_write(nid, action)) for nid in batch]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            if i + batch_size < len(member_list):
-                await asyncio.sleep(0.1)
+            for i in range(0, len(member_list), batch_size):
+                batch = member_list[i:i+batch_size]
+                # 构建显示名列表
+                display_names = [self.dm.get_alias_by_node_id(nid) for nid in batch]
+                success_count, fail_count = await self.engine.write_values_batch(batch, action, display_names)
+                if fail_count > 0:
+                    global_logger.error(f"Batch write partially failed: {success_count} ok, {fail_count} failed")
+
         global_logger.info(f"Group action '{group_name}' execution completed ({len(members)} nodes recursive).")

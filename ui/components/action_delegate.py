@@ -118,17 +118,20 @@ class ActionButtonDelegate(QStyledItemDelegate):
         # 获取别名用于日志显示
         alias = self.dm.get_alias_by_node_id(node_id)
         global_logger.info(f"==== UI单点操作触发 ==== -> [点位: {alias}] | 指令发送: 【{action_name}】")
-        
+
         if not self.opc_engine.connected:
             QMessageBox.warning(self.parent(), "错误", "目前未连接到 OPC UA 服务器。")
             return
-            
+
         # 操作反馈：改变光标状态
         QApplication.setOverrideCursor(Qt.WaitCursor)
         # 发起写入异步任务
         task = asyncio.create_task(self.opc_engine.write_node_value(node_id, target_val))
-        
-        # 挂载回调恢复光标
+
+        # 挂载回调恢复光标，确保无论如何都恢复光标
         def on_done(t):
-            QApplication.restoreOverrideCursor()
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass  # 防止 widget 已销毁时出错
         task.add_done_callback(on_done)

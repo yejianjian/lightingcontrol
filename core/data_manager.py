@@ -1,4 +1,5 @@
-from typing import Dict, Any
+from typing import Dict, Any, Set
+import asyncio
 from utils.persistence import PersistenceManager
 from utils.logger import global_logger
 
@@ -8,18 +9,19 @@ class DataManager:
     """
     def __init__(self, persistence_manager: PersistenceManager):
         self.nodes: Dict[str, Any] = {} # node_id -> {name, value, type, timestamp, alias}
-        
+
         self.pm = persistence_manager
         self.aliases = self.pm.get_all_aliases()
-        
+
         # 脏标记缓冲队列（用于防抖防卡死）
-        self.dirty_nodes = set()
-        self.structure_changed = False 
+        self._dirty_nodes: Set[str] = set()
+        self._dirty_lock = asyncio.Lock()
+        self.structure_changed = False
 
     def update_node(self, node_id: str, new_data: dict):
         # 过滤掉 asyncua 底层 Node 对象引用，避免存入数据总线导致 GC 无法回收
         filtered_data = {k: v for k, v in new_data.items() if k != 'node_obj'}
-        
+
         if node_id not in self.nodes:
             # 仅接受来自节点发现的完整数据（含 name 字段）创建新条目，
             # 跳过订阅推送中未知节点的数据（可能为服务端延迟推送或新增节点）
@@ -35,13 +37,19 @@ class DataManager:
             self.structure_changed = True
         else:
             self.nodes[node_id].update(filtered_data)
-            
-        self.dirty_nodes.add(node_id)
+
+        self._dirty_nodes.add(node_id)
+
+    def get_dirty_nodes_and_clear(self) -> Set[str]:
+        """原子地获取并清空脏节点集合，供 Qt 主线程调用"""
+        dirty = self._dirty_nodes
+        self._dirty_nodes = set()
+        return dirty
 
     def clear_nodes(self):
         """清空所有节点数据，用于断线时释放过期引用"""
         self.nodes.clear()
-        self.dirty_nodes.clear()
+        self._dirty_nodes.clear()
         self.structure_changed = True
 
     def set_alias(self, node_id: str, alias: str):
@@ -49,11 +57,15 @@ class DataManager:
         self.pm.set_alias(node_id, alias)
         if node_id in self.nodes:
             self.nodes[node_id]['alias'] = alias
-            self.dirty_nodes.add(node_id)
+            self._dirty_nodes.add(node_id)
+
+    def mark_dirty(self, node_id: str):
+        """标记节点为脏，用于外部模块触发 UI 刷新"""
+        self._dirty_nodes.add(node_id)
 
     def get_node_list(self):
         return list(self.nodes.values())
-        
+
     def get_alias_by_node_id(self, node_id: str) -> str:
         """根据 Node ID 获取别名，如果无别名则返回原始 ID"""
         if node_id in self.nodes:

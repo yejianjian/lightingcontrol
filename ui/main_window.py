@@ -148,7 +148,9 @@ class MainWindow(QMainWindow):
         self.clock_timer.start(1000)
 
     def _on_refresh_timer(self):
-        if not hasattr(self.dm, 'dirty_nodes') or (not self.dm.dirty_nodes and not getattr(self.dm, 'structure_changed', False)):
+        # 原子地获取脏节点，避免与订阅回调产生竞态
+        dirty_nodes = self.dm.get_dirty_nodes_and_clear()
+        if not dirty_nodes and not self.dm.structure_changed:
             return
 
         # 获取仪表盘统计数据
@@ -165,17 +167,15 @@ class MainWindow(QMainWindow):
         self.lbl_dash_total.setText(f"总点位数: {total}")
         self.lbl_dash_on.setText(f"开启: {on_count}")
         self.lbl_dash_off.setText(f"关闭: {off_count}")
-        
+
         # 判断是对可视区域做增量渲染，还是由于结构改变做了整体重新构建
-        if getattr(self.dm, 'structure_changed', False):
+        if self.dm.structure_changed:
             self.tab_monitor.on_refresh_clicked()
             self.dm.structure_changed = False
-        elif hasattr(self.dm, 'dirty_nodes') and self.dm.dirty_nodes:
+        elif dirty_nodes:
             # 委托子界面进行精确的行变动画重绘
             if hasattr(self.tab_monitor.model, 'update_nodes'):
-                self.tab_monitor.model.update_nodes(self.dm.dirty_nodes)
-                
-        self.dm.dirty_nodes.clear()
+                self.tab_monitor.model.update_nodes(dirty_nodes)
 
     def closeEvent(self, event):
         # 鉴权弹窗，阻止误关（使用顶层已导入的 QInputDialog/QLineEdit）

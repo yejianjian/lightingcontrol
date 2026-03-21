@@ -3,6 +3,7 @@ import os
 import socket
 import ipaddress
 import datetime
+import time
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography import x509
@@ -190,14 +191,24 @@ class OpcClientEngine:
                 except Exception:
                     pass
             self._monitor_task = None
-            
-        try:
-            if self.subscription:
+
+        # 先取消订阅，释放监控的节点引用
+        if self.subscription:
+            try:
                 await self.subscription.delete()
-        except Exception as e:
-            global_logger.warning(f"Error deleting subscription: {e}")
-        finally:
-            self.subscription = None
+            except Exception as e:
+                global_logger.warning(f"Error deleting subscription: {e}")
+            finally:
+                self.subscription = None
+
+        # 清理 Node 对象引用，防止内存泄漏
+        for node_data in self.nodes.values():
+            if 'node_obj' in node_data:
+                try:
+                    await node_data['node_obj'].close()
+                except Exception:
+                    pass
+        self.nodes.clear()
 
         try:
             if self.client:
@@ -206,8 +217,6 @@ class OpcClientEngine:
             global_logger.warning(f"Error disconnecting client: {e}")
         finally:
             self.client = None
-            # 清理节点引用，协助 GC
-            self.nodes.clear()
 
     async def get_all_nodes(self):
         if not self.connected:
@@ -285,6 +294,33 @@ class OpcClientEngine:
         except Exception as e:
             global_logger.error(f"Failed to create start_subscription: {e}", exc_info=True)
 
+    def _get_variant_type(self, node_id, value):
+        """获取写入值的 Variant 类型"""
+        variant_type = ua.VariantType.Boolean
+        if isinstance(value, bool):
+            variant_type = ua.VariantType.Boolean
+        elif isinstance(value, int):
+            variant_type = ua.VariantType.Int16
+        elif isinstance(value, float):
+            variant_type = ua.VariantType.Float
+
+        if node_id in self.nodes:
+            cached_type = self.nodes[node_id].get('type', '')
+            if 'Int' in cached_type:
+                variant_type = getattr(ua.VariantType, cached_type, ua.VariantType.Int16)
+                value = int(value)
+            elif 'Float' in cached_type or 'Double' in cached_type or 'Real' in cached_type:
+                variant_type = getattr(ua.VariantType, cached_type, ua.VariantType.Double)
+                value = float(value)
+            elif 'String' in cached_type:
+                variant_type = ua.VariantType.String
+                value = str(value)
+            elif 'Boolean' in cached_type:
+                variant_type = ua.VariantType.Boolean
+                value = bool(value)
+
+        return variant_type, value
+
     async def write_node_value(self, node_id, value, display_name=None):
         """
         向 OPC 服务器下发控制指令
@@ -292,49 +328,76 @@ class OpcClientEngine:
         if not self.connected:
             global_logger.warning("Attempted to write while not connected.")
             return False
-            
+
         target_display = display_name if display_name else node_id
+        ts_start = time.time()
         try:
             node = self.client.get_node(node_id)
-            
-            # 自动推断写入 Variant 类型（根据当前工程大部分为布尔量）
-            variant_type = ua.VariantType.Boolean
-            # 注意: Python 中 bool 是 int 的子类，bool 检查必须在 int 之前，
-            # 否则 True/False 会被 isinstance(value, int) 捕获导致类型错判
-            if isinstance(value, bool):
-                variant_type = ua.VariantType.Boolean
-            elif isinstance(value, int):
-                variant_type = ua.VariantType.Int16
-            elif isinstance(value, float):
-                variant_type = ua.VariantType.Float
-                
-            # 试图通过缓存里的真实节点类型做精确对齐
-            if node_id in self.nodes:
-                cached_type = self.nodes[node_id].get('type', '')
-                if 'Int' in cached_type:
-                    variant_type = getattr(ua.VariantType, cached_type, ua.VariantType.Int16)
-                    value = int(value)
-                elif 'Float' in cached_type or 'Double' in cached_type or 'Real' in cached_type:
-                    variant_type = getattr(ua.VariantType, cached_type, ua.VariantType.Double)
-                    value = float(value)
-                elif 'String' in cached_type:
-                     variant_type = ua.VariantType.String
-                     value = str(value)
-                elif 'Boolean' in cached_type:
-                     variant_type = ua.VariantType.Boolean
-                     value = bool(value)
 
+            variant_type, value = self._get_variant_type(node_id, value)
             data_value = ua.DataValue(ua.Variant(value, variant_type))
-            
-            # 添加了 asyncio.wait_for 5秒内超时以避免在网络被挂起时导致的整个协程假死不工作
+
             await asyncio.wait_for(node.write_value(data_value), timeout=5.0)
-            
-            global_logger.info(f"Successfully wrote {value} to node {target_display}")
+
+            elapsed_ms = (time.time() - ts_start) * 1000
+            global_logger.info(f"[WRITE] {target_display} = {value} | {elapsed_ms:.1f}ms")
             return True
-            
+
         except asyncio.TimeoutError:
-            global_logger.error(f"Timeout (5.0s) while writing to node {target_display}. The server might be unreachable or hanging.")
+            elapsed_ms = (time.time() - ts_start) * 1000
+            global_logger.error(f"Timeout (5.0s) while writing to node {target_display} | elapsed={elapsed_ms:.1f}ms")
             return False
         except Exception as e:
-            global_logger.error(f"Failed to write to node {target_display}: {e}", exc_info=True)
+            elapsed_ms = (time.time() - ts_start) * 1000
+            global_logger.error(f"Failed to write to node {target_display} | elapsed={elapsed_ms:.1f}ms | {e}")
             return False
+
+    async def write_values_batch(self, node_ids, value, display_names=None):
+        """
+        批量写入多个节点（方案B：使用 WriteList 减少 RTT）
+        node_ids: 节点ID列表
+        value: 写入的值（所有节点相同，如 True/False）
+        display_names: 可选，对应节点的显示名列表
+        返回: (成功数, 失败数)
+        """
+        if not self.connected:
+            global_logger.warning("Attempted batch write while not connected.")
+            return 0, len(node_ids)
+
+        if not node_ids:
+            return 0, 0
+
+        ts_start = time.time()
+        display_names = display_names or [None] * len(node_ids)
+
+        try:
+            nodes = [self.client.get_node(nid) for nid in node_ids]
+
+            # 预计算所有节点的 Variant 类型
+            variant_types = []
+            values = []
+            for nid, dv in zip(node_ids, display_names):
+                vt, val = self._get_variant_type(nid, value)
+                variant_types.append(vt)
+                values.append(val)
+
+            data_values = [ua.DataValue(ua.Variant(v, vt)) for v, vt in zip(values, variant_types)]
+
+            # 使用 write_values 批量写入，单次网络往返
+            await asyncio.wait_for(
+                self.client.write_values(nodes, data_values),
+                timeout=30.0  # 批量写入超时设长一些
+            )
+
+            elapsed_ms = (time.time() - ts_start) * 1000
+            global_logger.info(f"[BATCH_WRITE] {len(node_ids)} nodes = {value} | {elapsed_ms:.1f}ms | avg={elapsed_ms/len(node_ids):.2f}ms/node")
+            return len(node_ids), 0
+
+        except asyncio.TimeoutError:
+            elapsed_ms = (time.time() - ts_start) * 1000
+            global_logger.error(f"Batch write timeout | {len(node_ids)} nodes | elapsed={elapsed_ms:.1f}ms")
+            return 0, len(node_ids)
+        except Exception as e:
+            elapsed_ms = (time.time() - ts_start) * 1000
+            global_logger.error(f"Batch write failed | {len(node_ids)} nodes | elapsed={elapsed_ms:.1f}ms | {e}")
+            return 0, len(node_ids)

@@ -29,18 +29,23 @@ class UILogHandler(logging.Handler):
             msg = self.format(record)
             self._bridge.log_message.emit(msg)
         except RuntimeError:
-            pass  # widget 已销毁
+            # widget 已销毁，静默忽略
+            pass
+        except Exception as e:
+            # 记录其他异常
+            pass
 
 
 class TabLogs(QWidget):
     def __init__(self):
         super().__init__()
+        self._ui_handler = None  # 保存 handler 引用，销毁时移除
         self._setup_ui()
         self._hook_logger()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        
+
         btn_layout = QHBoxLayout()
         btn_clear = QPushButton("清空日志面板")
         btn_clear.clicked.connect(self.on_clear)
@@ -54,16 +59,28 @@ class TabLogs(QWidget):
         # 用深色背景贴合开发者习惯
         self.txt_logs.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, Courier New, monospace;")
         layout.addWidget(self.txt_logs)
-        
+
     def _hook_logger(self):
-        ui_handler = UILogHandler(self.txt_logs)
+        self._ui_handler = UILogHandler(self.txt_logs)
         # 套用和系统 logger 相同的格式模板
         formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s')
-        ui_handler.setFormatter(formatter)
-        ui_handler.setLevel(logging.INFO)
-        global_logger.addHandler(ui_handler)
-        
+        self._ui_handler.setFormatter(formatter)
+        self._ui_handler.setLevel(logging.INFO)
+        global_logger.addHandler(self._ui_handler)
+
         global_logger.info("UI Log Capture Initialized.")
 
     def on_clear(self):
         self.txt_logs.clear()
+
+    def closeEvent(self, event):
+        """窗口关闭时移除 handler，防止泄漏"""
+        self._cleanup()
+        super().closeEvent(event)
+
+    def _cleanup(self):
+        """移除日志 handler"""
+        if self._ui_handler is not None:
+            global_logger.removeHandler(self._ui_handler)
+            self._ui_handler = None
+            global_logger.info("UI Log handler removed.")
