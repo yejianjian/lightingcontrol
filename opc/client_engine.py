@@ -16,9 +16,14 @@ from utils.logger import global_logger
 class SubHandler:
     def __init__(self, callback):
         self.callback = callback
+        self.last_data_time = time.time()  # 订阅健康追踪：最后收到数据的时间
+        self.call_count = 0                # 总回调计数
 
     def datachange_notification(self, node, val, data):
         try:
+            self.last_data_time = time.time()
+            self.call_count += 1
+
             timestamp = None
             if hasattr(data, 'monitored_item') and hasattr(data.monitored_item, 'Value'):
                 timestamp = data.monitored_item.Value.SourceTimestamp
@@ -89,31 +94,38 @@ def generate_client_cert(cert_file="client_cert.der", key_file="client_key.pem")
     return cert_file, key_file, hostname
 
 class OpcClientEngine:
-    def __init__(self, host="localhost", port=48401, username="", password="", namespace_filter="ns=2;"):
+    def __init__(self, host="localhost", port=48401, username="", password="", namespace_filter="ns=2;", browse_max_depth=5):
         self.host = host
         self.port = port
         self.url = f"opc.tcp://{host}:{port}/"
         self.username = username
         self.password = password
         self.namespace_filter = namespace_filter  # 业务节点命名空间前缀，可配置
+        self.browse_max_depth = browse_max_depth  # 节点树遍历最大深度
         self.client = None
         self.nodes = {}
         self.subscription = None
+        self._sub_handler = None  # SubHandler 引用，用于健康检测
+        self._sub_callback = None  # 订阅回调引用，用于自动重建
         self.connected = False
         self.on_connection_lost = None  # 断线回调钩子
         self._monitor_task = None
+        self._consecutive_write_failures = 0  # 连续写入失败计数
+        self._max_write_failures = 3         # 连续失败阈值，超过触发重连
         
     async def connect(self):
         cert_file, key_file, hostname = generate_client_cert()
         self.client = Client(url=self.url)
         self.client.application_uri = "urn:example.org:FreeOpcUa:opcua-asyncio"
         
-        # [Phase 10] 修正 45 分钟断线规律问题
-        # 1. 调长安全通道寿命至 24 小时 (单位:ms)，规避 1 小时周期下 75% 时间点的续约失败
-        self.client.secure_channel_timeout = 86400000 
+        # 不再强行覆写 secure_channel_timeout 和 session_timeout，
+        # 让服务器通过 RevisedLifetime 决定实际值。
+        # asyncua 默认 3600000ms(1h)，服务器通常也接受此值。
+        # asyncua 内部的 _renew_channel_loop 会在 75% 时间点(~45min)自动续约。
         
-        # 2. 校正 Session 活跃超时时长，设为 30 分钟 (单位:ms)，增加弱网环境下的 Session 持久度
-        self.client.session_timeout = 1800000 
+        # 绑定 asyncua 原生的 connection_lost_callback（异步回调）
+        # 当 asyncua 内部的看门狗或续约 Task 检测到连接丢失时，会调用此回调
+        self.client.connection_lost_callback = self._on_asyncua_connection_lost
         
         if self.username:
             self.client.set_user(self.username)
@@ -136,6 +148,7 @@ class OpcClientEngine:
         try:
             await self.client.connect()
             self.connected = True
+            global_logger.info(f"Connected. SecureChannel timeout={self.client.secure_channel_timeout}ms, Session timeout={self.client.session_timeout}ms")
             # 启动后台心跳检测任务
             self._start_monitor()
             return True
@@ -151,17 +164,52 @@ class OpcClientEngine:
             self._monitor_task.cancel()
         self._monitor_task = asyncio.create_task(self._monitor_connection())
 
+    async def _on_asyncua_connection_lost(self, exc):
+        """asyncua 内部检测到的连接丢失回调（异步）
+        
+        当 asyncua 的 _monitor_server_loop 看门狗检测到服务器不可达时触发。
+        这是续约失败后的最终防线。
+        """
+        global_logger.error(f"asyncua internal connection lost detected: {exc}")
+        if self.connected:
+            self.connected = False
+            if self.on_connection_lost and callable(self.on_connection_lost):
+                try:
+                    self.on_connection_lost()
+                except Exception as cb_err:
+                    global_logger.error(f"on_connection_lost callback error: {cb_err}")
+
     async def _monitor_connection(self):
         """心跳检测：定期读取服务器状态节点，检测断线"""
         try:
             while self.connected:
-                await asyncio.sleep(20) # 原5秒，放宽至20秒以防狂刷日志
+                await asyncio.sleep(15)
                 if not self.connected:
                     break
                 try:
-                    # 读取服务器状态节点（标准 OPC UA 节点）作为心跳
+                    # 检查 asyncua 内部的续约 Task 是否已崩溃退出
+                    if self.client and hasattr(self.client, '_renew_channel_task'):
+                        task = self.client._renew_channel_task
+                        if task and task.done():
+                            exc = task.exception() if not task.cancelled() else None
+                            global_logger.error(f"asyncua _renew_channel_task has died! Exception: {exc}")
+                            raise Exception(f"SecureChannel renew task crashed: {exc}")
+                    
+                    if self.client and hasattr(self.client, '_monitor_server_task'):
+                        task = self.client._monitor_server_task
+                        if task and task.done():
+                            exc = task.exception() if not task.cancelled() else None
+                            global_logger.error(f"asyncua _monitor_server_task has died! Exception: {exc}")
+                            raise Exception(f"Server monitor task crashed: {exc}")
+
+                    # 读取服务器状态节点（标准 OPC UA 节点）作为心跳并加入超时保护
                     server_state = self.client.get_node("i=2259")
-                    await server_state.read_value()
+                    await asyncio.wait_for(server_state.read_value(), timeout=5.0)
+
+                    # 额外校验订阅的健康度 (距离上次收到推送是否超过45秒)
+                    if self._sub_handler and getattr(self._sub_handler, 'last_data_time', None) and (time.time() - self._sub_handler.last_data_time) > 45.0:
+                        global_logger.error("Subscription heartbeat timeout (>45s without push data), treating as connection lost.")
+                        raise Exception("Subscription dead")
                 except (asyncio.CancelledError, GeneratorExit):
                     break
                 except Exception as e:
@@ -179,106 +227,129 @@ class OpcClientEngine:
             global_logger.debug("Connection monitor task exited.")
             
     async def disconnect(self):
+        global_logger.info("[disconnect] Starting disconnect sequence...")
         # 先标记为不连通，防止监控任务进入下一次循环
         self.connected = False
 
         # 停止心跳监视
         if self._monitor_task:
+            global_logger.info("[disconnect] Cancelling _monitor_task...")
             if not self._monitor_task.done():
                 self._monitor_task.cancel()
-                try:
-                    await asyncio.wait_for(self._monitor_task, timeout=2.0)
-                except Exception:
-                    pass
+            # 放弃等待 _monitor_task 退出，防止在特殊情况下因为 qasync 事件循环问题造成死锁
             self._monitor_task = None
+            global_logger.info("[disconnect] _monitor_task cancelled.")
 
-        # 先取消订阅，释放监控的节点引用
+        # 先取消订阅（加超时保护，防止在死连接上挂起）
         if self.subscription:
+            global_logger.info("[disconnect] Deleting subscription...")
             try:
-                await self.subscription.delete()
+                await asyncio.wait_for(self.subscription.delete(), timeout=3.0)
+                global_logger.info("[disconnect] Subscription deleted successfully.")
+            except asyncio.TimeoutError:
+                global_logger.warning("Subscription delete timed out (connection already dead), skipping.")
             except Exception as e:
                 global_logger.warning(f"Error deleting subscription: {e}")
             finally:
                 self.subscription = None
 
         # 清理 Node 对象引用，防止内存泄漏
-        for node_data in self.nodes.values():
-            if 'node_obj' in node_data:
-                try:
-                    await node_data['node_obj'].close()
-                except Exception:
-                    pass
         self.nodes.clear()
 
-        try:
-            if self.client:
-                await self.client.disconnect()
-        except Exception as e:
-            global_logger.warning(f"Error disconnecting client: {e}")
-        finally:
-            self.client = None
+        # 断开客户端连接（加超时保护，防止在死连接上挂起）
+        if self.client:
+            global_logger.info("[disconnect] Disconnecting asyncua client...")
+            try:
+                await asyncio.wait_for(self.client.disconnect(), timeout=5.0)
+                global_logger.info("[disconnect] asyncua client disconnected successfully.")
+            except asyncio.TimeoutError:
+                global_logger.warning("Client disconnect timed out (connection already dead), force closing socket.")
+                # 超时后强制关闭底层 socket
+                try:
+                    self.client.disconnect_socket()
+                except Exception:
+                    pass
+            except Exception as e:
+                global_logger.warning(f"Error disconnecting client: {e}")
+                # 异常后也尝试强制关闭 socket
+                try:
+                    self.client.disconnect_socket()
+                except Exception:
+                    pass
+            finally:
+                self.client = None
+        global_logger.info("[disconnect] Disconnect sequence complete.")
 
     async def get_all_nodes(self):
         if not self.connected:
             return []
-        
-        
+
         objects_node = self.client.nodes.objects
-        
         discovered_nodes = []
-        async def browse_recursive(node, max_depth=5):
-            if max_depth <= 0: return
-            try:
-                children = await node.get_children()
-                for child in children:
-                    try:
-                        node_class = await child.read_node_class()
-                        if node_class == ua.NodeClass.Variable:
-                            node_idx = child.nodeid.to_string()
-                            
-                            # 仅关注业务控制命名空间的节点，过滤系统节点
-                            if self.namespace_filter and not node_idx.startswith(self.namespace_filter):
-                                continue
-
-                            name = (await child.read_display_name()).Text
-                            try:
-                                val_obj = await child.read_data_value()
-                                val = val_obj.Value.Value if val_obj.Value else None
-                                timestamp = val_obj.SourceTimestamp.strftime("%Y-%m-%d %H:%M:%S") if val_obj.SourceTimestamp else ""
-                                vtype = val_obj.Value.VariantType.name if val_obj.Value else None
-                            except Exception:
-                                val = None
-                                timestamp = ""
-                                vtype = None
-                                
-                            dtype = vtype if vtype else (type(val).__name__ if val is not None else "Unknown")
-
-                            if name != "ServerStatus":
-                                discovered_nodes.append({
-                                    "name": name,
-                                    "node_id": node_idx,
-                                    "type": dtype,
-                                    "value": val,
-                                    "timestamp": timestamp,
-                                    "node_obj": child
-                                })
-                        elif node_class == ua.NodeClass.Object:
-                            await browse_recursive(child, max_depth - 1)
-                    except Exception as child_err:
-                        global_logger.warning(f"Error reading child {child}: {child_err}")
-            except Exception as e:
-                global_logger.warning(f"Error browsing node {node}: {e}")
-        
-        await browse_recursive(objects_node)
+        await self._browse_recursive(objects_node, discovered_nodes, self.browse_max_depth)
         self.nodes = {n['node_id']: n for n in discovered_nodes}
         # 返回给外层的数据剥离 node_obj（底层 asyncua 引用），
         # node_obj 仅保留在 self.nodes 内部缓存中供订阅使用
         return [{k: v for k, v in n.items() if k != 'node_obj'} for n in discovered_nodes]
 
+    async def _browse_recursive(self, node, discovered_nodes, depth_remaining):
+        """递归遍历 OPC UA 节点树，收集业务变量节点"""
+        if depth_remaining <= 0:
+            return
+        try:
+            children = await node.get_children()
+            for child in children:
+                try:
+                    node_class = await child.read_node_class()
+                    if node_class == ua.NodeClass.Variable:
+                        node_idx = child.nodeid.to_string()
+
+                        # 仅关注业务控制命名空间的节点，过滤系统节点
+                        if self.namespace_filter and not node_idx.startswith(self.namespace_filter):
+                            continue
+
+                        name = (await child.read_display_name()).Text
+                        try:
+                            val_obj = await child.read_data_value()
+                            val = val_obj.Value.Value if val_obj.Value else None
+                            timestamp = val_obj.SourceTimestamp.strftime("%Y-%m-%d %H:%M:%S") if val_obj.SourceTimestamp else ""
+                            vtype = val_obj.Value.VariantType.name if val_obj.Value else None
+                        except Exception:
+                            val = None
+                            timestamp = ""
+                            vtype = None
+
+                        dtype = vtype if vtype else (type(val).__name__ if val is not None else "Unknown")
+
+                        if name != "ServerStatus":
+                            discovered_nodes.append({
+                                "name": name,
+                                "node_id": node_idx,
+                                "type": dtype,
+                                "value": val,
+                                "timestamp": timestamp,
+                                "node_obj": child
+                            })
+                    elif node_class == ua.NodeClass.Object:
+                        await self._browse_recursive(child, discovered_nodes, depth_remaining - 1)
+                except Exception as child_err:
+                    global_logger.warning(f"Error reading child {child}: {child_err}")
+        except Exception as e:
+            global_logger.warning(f"Error browsing node {node}: {e}")
+
     async def start_subscription(self, callback):
         if not self.connected or not self.nodes: return
         node_objs = [n['node_obj'] for n in self.nodes.values()]
+        
+        # 将标准的心跳时间节点 i=2258 (CurrentTime) 加入订阅, 以确保持续触发 datachange_notification 来做健康度判定
+        try:
+            server_time_node = self.client.get_node("i=2258")
+            node_objs.append(server_time_node)
+        except Exception as e:
+            global_logger.warning(f"Could not add server current time to subscription: {e}")
+        self._sub_callback = callback  # 保存回调引用，以便自动重建订阅
         handler = SubHandler(callback)
+        self._sub_handler = handler  # 保存 handler 引用，用于健康检测
         # Create a subscription with a 500ms publishing interval
         try:
             self.subscription = await self.client.create_subscription(500, handler)
@@ -341,15 +412,18 @@ class OpcClientEngine:
 
             elapsed_ms = (time.time() - ts_start) * 1000
             global_logger.info(f"[WRITE] {target_display} = {value} | {elapsed_ms:.1f}ms")
+            self._consecutive_write_failures = 0  # 成功时重置计数器
             return True
 
         except asyncio.TimeoutError:
             elapsed_ms = (time.time() - ts_start) * 1000
             global_logger.error(f"Timeout (5.0s) while writing to node {target_display} | elapsed={elapsed_ms:.1f}ms")
+            self._on_write_failure()
             return False
         except Exception as e:
             elapsed_ms = (time.time() - ts_start) * 1000
             global_logger.error(f"Failed to write to node {target_display} | elapsed={elapsed_ms:.1f}ms | {e}")
+            self._on_write_failure()
             return False
 
     async def write_values_batch(self, node_ids, value, display_names=None):
@@ -396,8 +470,29 @@ class OpcClientEngine:
         except asyncio.TimeoutError:
             elapsed_ms = (time.time() - ts_start) * 1000
             global_logger.error(f"Batch write timeout | {len(node_ids)} nodes | elapsed={elapsed_ms:.1f}ms")
+            self._on_write_failure()
             return 0, len(node_ids)
         except Exception as e:
             elapsed_ms = (time.time() - ts_start) * 1000
             global_logger.error(f"Batch write failed | {len(node_ids)} nodes | elapsed={elapsed_ms:.1f}ms | {e}")
+            self._on_write_failure()
             return 0, len(node_ids)
+
+    def _on_write_failure(self):
+        """写入失败时累加计数，连续失败超过阈值时触发重连"""
+        self._consecutive_write_failures += 1
+        global_logger.warning(
+            f"Write failure count: {self._consecutive_write_failures}/{self._max_write_failures}"
+        )
+        if self._consecutive_write_failures >= self._max_write_failures:
+            global_logger.error(
+                f"Consecutive write failures reached threshold ({self._max_write_failures}). "
+                f"Connection appears stale. Triggering reconnection..."
+            )
+            self.connected = False
+            self._consecutive_write_failures = 0
+            if self.on_connection_lost and callable(self.on_connection_lost):
+                try:
+                    self.on_connection_lost()
+                except Exception as cb_err:
+                    global_logger.error(f"on_connection_lost callback error: {cb_err}")

@@ -1,3 +1,10 @@
+# ======================================================================
+# ⚠️ 已弃用 (DEPRECATED)
+# 此文件为早期独立版本的 GroupScheduler 测试副本，与实际代码
+# (core/group_scheduler.py) 严重不同步。请勿基于此文件开发或测试。
+# 建议后续使用 pytest + unittest.mock 编写规范化测试。
+# ======================================================================
+
 import asyncio
 from datetime import datetime
 

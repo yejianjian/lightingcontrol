@@ -21,6 +21,9 @@ class PersistenceManager:
             data_file = os.path.join(_get_base_dir(), data_file)
         self.data_file = data_file
         self._batch_count = 0  # 批量模式嵌套计数
+        self._load_failed = False  # 标记配置文件是否全部加载失败
+        self._groups_index = {}     # id -> group_obj 索引
+        self._schedules_index = {}  # id -> schedule_obj 索引
         self.data_store = {
             "aliases": {},  # node_id: "自定义名称"
             "groups": [],   # 升级为列表结构: [{"id": "uuid", "name": "...", "parent_id": None, "nodes": [...]}, ...]
@@ -77,11 +80,20 @@ class PersistenceManager:
                         global_logger.warning(f"Primary config corrupted, restored from backup: {path}")
                     else:
                         global_logger.info(f"Successfully loaded configuration from {path}")
+                    self._rebuild_index()
                     break
                 except Exception as e:
                     global_logger.error(f"Failed to load configuration from {path}: {e}")
         if not loaded:
-            global_logger.info(f"{self.data_file} not found. A new one will be created upon saving.")
+            # 检查是文件不存在还是文件损坏
+            primary_exists = os.path.exists(self.data_file)
+            backup_exists = os.path.exists(self.data_file + ".bak")
+            if primary_exists or backup_exists:
+                # 文件存在但加载失败（损坏）
+                self._load_failed = True
+                global_logger.error(f"Configuration files corrupted. Both primary and backup failed to load.")
+            else:
+                global_logger.info(f"{self.data_file} not found. A new one will be created upon saving.")
 
     @contextmanager
     def batch_mode(self):
@@ -112,7 +124,10 @@ class PersistenceManager:
                 except OSError:
                     pass  # 备份失败不阻塞主流程
             os.replace(tmp_file, self.data_file)
+            # 保存成功后清除损坏标记
+            self._load_failed = False
             global_logger.debug(f"Configuration saved to {self.data_file}")
+            self._rebuild_index()
         except Exception as e:
             global_logger.error(f"Failed to save configuration: {e}")
             # 清理可能残留的临时文件
@@ -121,6 +136,10 @@ class PersistenceManager:
                     os.remove(tmp_file)
                 except OSError:
                     pass
+
+    def was_load_corrupted(self) -> bool:
+        """检查配置文件是否在加载时损坏（主文件和备份都损坏）"""
+        return self._load_failed
 
     # --- 别名 (Alias/Remark) API ---
     def get_all_aliases(self) -> dict:
@@ -209,21 +228,19 @@ class PersistenceManager:
         return all_node_ids
 
     def get_group_by_id(self, group_id: str):
-        for g in self.data_store["groups"]:
-            if g["id"] == group_id:
-                return g
-        return None
+        return self._groups_index.get(group_id)
+
+    def _rebuild_index(self):
+        """重建 groups 和 schedules 的 O(1) 查找索引"""
+        self._groups_index = {g["id"]: g for g in self.data_store.get("groups", [])}
+        self._schedules_index = {s.get("id"): s for s in self.data_store.get("schedules", []) if s.get("id")}
 
     # --- Schedule API (调度器预留) ---
     def get_schedules(self):
         return self.data_store.get("schedules", [])
 
     def get_schedule_by_id(self, sched_id):
-        schedules = self.data_store.get("schedules", [])
-        for s in schedules:
-            if s.get("id") == sched_id:
-                return s
-        return None
+        return self._schedules_index.get(sched_id)
 
     def add_schedule(self, schedule_dict):
         """传入字典包含: id, group_id, time(HH:MM), action(bool), enabled"""

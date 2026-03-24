@@ -10,7 +10,23 @@
       "WebFetch(domain:pypi.org)",
       "Bash(python:*)",
       "Bash(./venv38/Scripts/python -c \"from ui.tabs.tab_group import TabGroup, GroupMemberTableModel; print\\('OK'\\)\")",
-      "Bash(./venv38/Scripts/python main.py)"
+      "Bash(./venv38/Scripts/python main.py)",
+      "Bash(claude config:*)",
+      "Bash(./venv38/Scripts/python -c \"from ui.tabs.tab_settings import TabSettings; from ui.main_window import MainWindow; from core.data_manager import DataManager; from core.group_scheduler import GroupScheduler; from utils.persistence import PersistenceManager; print\\(''OK''\\)\")",
+      "Bash(./venv38/Scripts/python -c \":*)",
+      "Bash(./venv38/Scripts/python -m py_compile core/data_manager.py core/group_scheduler.py utils/persistence.py ui/main_window.py ui/tabs/tab_settings.py)",
+      "Bash(./venv38/Scripts/python -m py_compile ui/main_window.py ui/tabs/tab_settings.py ui/tabs/tab_group.py ui/tabs/tab_logs.py ui/style.qss)",
+      "Bash(./venv38/Scripts/python -m py_compile ui/main_window.py ui/tabs/tab_settings.py ui/tabs/tab_group.py ui/tabs/tab_logs.py)",
+      "Bash(./venv38/Scripts/python -m py_compile ui/main_window.py ui/tabs/tab_settings.py ui/tabs/tab_logs.py)",
+      "Bash(./venv38/Scripts/python -m py_compile ui/main_window.py ui/tabs/tab_settings.py)",
+      "Bash(xxd)",
+      "Bash(. venv38/Scripts/activate)",
+      "Bash(pyinstaller LightingControlOPC_Win2012.spec --distpath dist)",
+      "Bash(\"D:/lightingcontrol/venv38/Scripts/pyinstaller.exe\" --clean --noconfirm \"LightingControlOPC_Win2012.spec\")",
+      "Bash(ls *.py)",
+      "Bash(ls:*)",
+      "Bash(./venv38/Scripts/pyinstaller.exe LightingControlOPC.spec --clean 2>&1)",
+      "Bash(./venv38/Scripts/python.exe -c \"import sys; print\\(sys.version\\)\")"
     ]
   }
 }

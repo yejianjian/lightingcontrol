@@ -16,6 +16,7 @@ class GroupScheduler:
         self.running = False
         self._task = None
         self.pending_actions = [] # 元素结构: {"group_id": uuid, "action": bool, "timestamp": datetime}
+        self._pending_lock = asyncio.Lock()  # 保护 pending_actions 列表
         self._batch_semaphore = None  # 控制批量写入并发
 
     def start(self):
@@ -92,40 +93,51 @@ class GroupScheduler:
                 # 若连接正常且有未决任务，则分配后台异步补偿任务
                 if self.engine.connected and self.pending_actions:
                     expired_pkgs = []
-                    for action_pkg in self.pending_actions:
-                        if action_pkg.get("processing"):
-                            continue  # 防止重复派发
-                            
-                        ts_str = action_pkg["timestamp"].strftime("%H:%M:%S")
-                        g_id = action_pkg["group_id"]
-                        g_obj = self.dm.pm.get_group_by_id(g_id)
-                        g_display = g_obj.get("name") if g_obj else g_id
-                        
-                        # 检查是否过期 (超时 10 分钟作废)
-                        if (now - action_pkg["timestamp"]).total_seconds() > 600:
-                            global_logger.warning(f"Recovery: Discarded expired (10min+) pending task for group '{g_display}' (originally at {ts_str})")
-                            expired_pkgs.append(action_pkg)
-                        else:
-                            global_logger.info(f"Recovery: Async dispatch for missed task for group '{g_display}' (originally at {ts_str})")
-                            action_pkg["processing"] = True
-                            
-                            async def _do_recover(pkg, name_disp):
-                                try:
-                                    await self._execute_group_action(pkg["group_id"], pkg["action"], is_recovery=True)
-                                    if pkg in self.pending_actions:
-                                        self.pending_actions.remove(pkg)
-                                except Exception as e:
+                    dispatch_pkgs = []
+                    async with self._pending_lock:
+                        current_actions = list(self.pending_actions)
+                        for action_pkg in current_actions:
+                            if action_pkg.get("processing"):
+                                continue  # 防止重复派发
+
+                            ts_str = action_pkg["timestamp"].strftime("%H:%M:%S")
+                            g_id = action_pkg["group_id"]
+                            g_obj = self.dm.pm.get_group_by_id(g_id)
+                            g_display = g_obj.get("name") if g_obj else g_id
+
+                            # 检查是否过期 (超时 10 分钟作废)
+                            if (now - action_pkg["timestamp"]).total_seconds() > 600:
+                                global_logger.warning(f"Recovery: Discarded expired (10min+) pending task for group '{g_display}' (originally at {ts_str})")
+                                expired_pkgs.append(action_pkg)
+                            else:
+                                global_logger.info(f"Recovery: Async dispatch for missed task for group '{g_display}' (originally at {ts_str})")
+                                action_pkg["processing"] = True
+                                dispatch_pkgs.append((action_pkg, g_display))
+
+                        # 立即移除已过期任务
+                        for pkg in expired_pkgs:
+                            try:
+                                self.pending_actions.remove(pkg)
+                            except ValueError:
+                                pass
+
+                    # 在锁外派发异步任务
+                    for action_pkg, g_display in dispatch_pkgs:
+                        async def _do_recover(pkg, name_disp):
+                            try:
+                                success = await self._execute_group_action(pkg["group_id"], pkg["action"], is_recovery=True)
+                                if success:
+                                    async with self._pending_lock:
+                                        if pkg in self.pending_actions:
+                                            self.pending_actions.remove(pkg)
+                                else:
+                                    # 恢复失败或部分失败，解开 processing 标记待下次重试
                                     pkg["processing"] = False
-                                    global_logger.error(f"Recovery execution failed for group '{name_disp}': {e}")
-                                    
-                            asyncio.create_task(_do_recover(action_pkg, g_display))
-                    
-                    # 立即移除已过期任务
-                    for pkg in expired_pkgs:
-                        try:
-                            self.pending_actions.remove(pkg)
-                        except ValueError:
-                            pass
+                            except Exception as e:
+                                pkg["processing"] = False
+                                global_logger.error(f"Recovery execution failed for group '{name_disp}': {e}")
+
+                        asyncio.create_task(_do_recover(action_pkg, g_display))
                     
             except asyncio.CancelledError:
                 break
@@ -141,38 +153,61 @@ class GroupScheduler:
         if not self.engine.connected:
             if not is_recovery:
                 # 入队前去重：同组+同操作不重复入队
-                already_queued = any(
-                    p.get("group_id") == group_id and p["action"] == action
-                    for p in self.pending_actions
-                )
-                if not already_queued:
-                    global_logger.warning(f"Scheduler active but OPC engine is disconnected. Task for group '{group_name}' queued for recovery.")
-                    # 限制队列大小，超出则移除最旧的
-                    if len(self.pending_actions) >= MAX_PENDING_ACTIONS:
-                        removed = self.pending_actions.pop(0)
-                        global_logger.warning(f"Pending queue full, removed oldest: {removed['group_id']}")
-                    self.pending_actions.append({"group_id": group_id, "action": action, "timestamp": datetime.now()})
-                else:
-                    global_logger.debug(f"Duplicate pending task for '{group_name}' (ID: {group_id}) skipped.")
-            return
+                async with self._pending_lock:
+                    already_queued = any(
+                        p.get("group_id") == group_id and p["action"] == action
+                        for p in self.pending_actions
+                    )
+                    if not already_queued:
+                        global_logger.warning(f"Scheduler active but OPC engine is disconnected. Task for group '{group_name}' queued for recovery.")
+                        self.pending_actions.append({"group_id": group_id, "action": action, "timestamp": datetime.now()})
+                    else:
+                        global_logger.debug(f"Duplicate pending task for '{group_name}' (ID: {group_id}) skipped.")
+            return False
 
         # 递归获取成员（包含所有子分组的控制点）
         members = self.dm.pm.get_group_nodes_recursive(group_id)
         if not members:
              global_logger.warning(f"Scheduler active but group '{group_name}' (ID: {group_id}) is empty or has no nodes recursive.")
-             return
+             return False
 
         # 方案B：使用 WriteList 批量写入，限制并发数
+        total_success = 0
+        total_fail = 0
         async with self._batch_semaphore:
             member_list = list(members)
             batch_size = 100  # 增大批次，减少网络往返
 
             for i in range(0, len(member_list), batch_size):
+                # 写入过程中如果连接断开（被 _on_write_failure 触发），立即停止后续批次
+                if not self.engine.connected:
+                    remaining = len(member_list) - i
+                    global_logger.warning(f"Connection lost during batch write for '{group_name}', {remaining} nodes skipped.")
+                    total_fail += remaining
+                    break
+
                 batch = member_list[i:i+batch_size]
                 # 构建显示名列表
                 display_names = [self.dm.get_alias_by_node_id(nid) for nid in batch]
                 success_count, fail_count = await self.engine.write_values_batch(batch, action, display_names)
+                total_success += success_count
+                total_fail += fail_count
                 if fail_count > 0:
                     global_logger.error(f"Batch write partially failed: {success_count} ok, {fail_count} failed")
 
+        # 如果写入过程中连接断开，将此任务入队等待重连后恢复
+        if not self.engine.connected and not is_recovery and total_fail > 0:
+            async with self._pending_lock:
+                already_queued = any(
+                    p.get("group_id") == group_id and p["action"] == action
+                    for p in self.pending_actions
+                )
+                if not already_queued:
+                    global_logger.warning(
+                        f"Scheduled task for group '{group_name}' failed due to connection loss during execution. "
+                    )
+                    self.pending_actions.append({"group_id": group_id, "action": action, "timestamp": datetime.now()})
+            return False
+
         global_logger.info(f"Group action '{group_name}' execution completed ({len(members)} nodes recursive).")
+        return total_fail == 0

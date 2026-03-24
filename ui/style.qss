@@ -1,15 +1,14 @@
 /* =========================================================
-   全局现代化样式表 (Modern UI Stylesheet)
-   灵感来源: Antigravity Tools Dashboard 卡片式设计
-   色彩规范:
-   - 全局背景: #f4f7fb (极淡浅蓝偏灰)
-   - 卡片背景: #ffffff (纯白)
-   - 文本色: #0f172a (主标题黑), #475569 (正文深灰), #64748b (辅助浅灰)
-   - 边框色: #e2e8f0 (主边框), #f1f5f9 (内网格/修饰)
-   - 主色调/主按钮: #3b82f6 (明亮蓝)
+   鍏ㄥ眬鐜颁唬鍖栨牱寮忚〃 (Modern UI Stylesheet)
+   鐏垫劅鏉ユ簮: Antigravity Tools Dashboard 鍗＄墖寮忚璁?   鑹插僵瑙勮寖:
+   - 鍏ㄥ眬鑳屾櫙: #f4f7fb (鏋佹贰娴呰摑鍋忕伆)
+   - 鍗＄墖鑳屾櫙: #ffffff (绾櫧)
+   - 鏂囨湰鑹? #0f172a (涓绘爣棰橀粦), #475569 (姝ｆ枃娣辩伆), #64748b (杈呭姪娴呯伆)
+   - 杈规鑹? #e2e8f0 (涓昏竟妗?, #f1f5f9 (鍐呯綉鏍?淇グ)
+   - 涓昏壊璋?涓绘寜閽? #3b82f6 (鏄庝寒钃?
 ========================================================= */
 
-/* --- 1. 全局背景与字体 --- */
+/* --- 1. 鍏ㄥ眬鑳屾櫙涓庡瓧浣?--- */
 QMainWindow {
     background-color: #f4f7fb;
 }
@@ -19,17 +18,17 @@ QWidget {
     color: #0f172a;
 }
 
-/* 覆盖特定卡片/面板的基础 QWidget 背景透明，防止全局底色覆盖卡片里的元素 */
+/* 瑕嗙洊鐗瑰畾鍗＄墖/闈㈡澘鐨勫熀纭€ QWidget 鑳屾櫙閫忔槑锛岄槻姝㈠叏灞€搴曡壊瑕嗙洊鍗＄墖閲岀殑鍏冪礌 */
 QFrame#DashboardCard {
     background-color: #ffffff;
     border: 1px solid #e2e8f0;
     border-radius: 12px;
 }
 
-/* --- 2. 按钮 (Buttons) --- */
+/* --- 2. 鎸夐挳 (Buttons) --- */
 QPushButton {
     background-color: #ffffff;
-    color: #3b82f6; /* 主色调字色 */
+    color: #3b82f6; /* 涓昏壊璋冨瓧鑹?*/
     border: 1px solid #bfdbfe;
     border-radius: 6px;
     padding: 6px 16px;
@@ -49,9 +48,9 @@ QPushButton:disabled {
     border: 1px solid #e2e8f0;
 }
 
-/* 如果有一些特别指定的按钮如更新、导出，可以用特定类名，这里通配基础 */
+/* 濡傛灉鏈変竴浜涚壒鍒寚瀹氱殑鎸夐挳濡傛洿鏂般€佸鍑猴紝鍙互鐢ㄧ壒瀹氱被鍚嶏紝杩欓噷閫氶厤鍩虹 */
 
-/* --- 3. 文本输入框与下拉框 (LineEdits & ComboBoxes) --- */
+/* --- 3. 鏂囨湰杈撳叆妗嗕笌涓嬫媺妗?(LineEdits & ComboBoxes) --- */
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background-color: #ffffff;
     border: 1px solid #cbd5e1;
@@ -69,13 +68,13 @@ QLineEdit:hover, QComboBox:hover {
     border: 1px solid #94a3b8;
 }
 
-/* 下拉框特定的箭头按钮改造 */
+/* 涓嬫媺妗嗙壒瀹氱殑绠ご鎸夐挳鏀归€?*/
 QComboBox::drop-down {
     border: none;
     width: 24px;
 }
 QComboBox::down-arrow {
-    /* 如果有图片可以用 image: url(...); 这里简单留空，依靠默认也能凑合，或者画个向下的小三角 (需图片或自定义) */
+    /* 濡傛灉鏈夊浘鐗囧彲浠ョ敤 image: url(...); 杩欓噷绠€鍗曠暀绌猴紝渚濋潬榛樿涔熻兘鍑戝悎锛屾垨鑰呯敾涓悜涓嬬殑灏忎笁瑙?(闇€鍥剧墖鎴栬嚜瀹氫箟) */
     width: 0px; 
 }
 QComboBox QAbstractItemView {
@@ -87,17 +86,18 @@ QComboBox QAbstractItemView {
     outline: none;
 }
 
-/* --- 4. 标签页 (TabWidget & TabBar) --- */
+/* --- 4. 鏍囩椤?(TabWidget & TabBar) --- */
 QTabWidget::pane {
     border: 0px; 
-    border-top: 1px solid #e2e8f0; /* 仅保留顶部分隔 */
+    border-top: 1px solid #e2e8f0; /* 浠呬繚鐣欓《閮ㄥ垎闅?*/
     background-color: transparent; 
 }
 
 QTabBar::tab {
     background-color: transparent;
     color: #64748b;
-    padding: 10px 24px;
+    padding: 8px 24px; /* 调整 padding 避免挤压文字 */
+    min-height: 28px;  /* 增加基础高度以防止中文字体顶部被截断 */
     font-size: 15px;
     font-weight: 600;
     border-bottom: 3px solid transparent; /* 留出底部边框空间 */
@@ -106,7 +106,7 @@ QTabBar::tab {
 
 QTabBar::tab:selected {
     color: #3b82f6;
-    border-bottom: 3px solid #3b82f6; /* 选中时变成蓝色下划线 */
+    border-bottom: 3px solid #3b82f6; /* 閫変腑鏃跺彉鎴愯摑鑹蹭笅鍒掔嚎 */
 }
 
 QTabBar::tab:hover:!selected {
@@ -114,16 +114,16 @@ QTabBar::tab:hover:!selected {
     border-bottom: 3px solid #cbd5e1;
 }
 
-/* --- 5. 表格与树形视图 (TableView & TreeView) --- */
+/* --- 5. 琛ㄦ牸涓庢爲褰㈣鍥?(TableView & TreeView) --- */
 QTableView, QTreeView, QListView {
     background-color: #ffffff;
     border: 1px solid #e2e8f0;
     border-radius: 8px;
-    gridline-color: #f1f5f9; /* 去掉强烈的黑框，使用淡色分隔线 */
+    gridline-color: #f1f5f9; /* 鍘绘帀寮虹儓鐨勯粦妗嗭紝浣跨敤娣¤壊鍒嗛殧绾?*/
     selection-background-color: #eff6ff;
     selection-color: #0f172a;
-    alternate-background-color: #f8fafc; /* 交替行背景 */
-    outline: none; /* 去除选中的虚线框 */
+    alternate-background-color: #f8fafc; /* 浜ゆ浛琛岃儗鏅?*/
+    outline: none; /* 鍘婚櫎閫変腑鐨勮櫄绾挎 */
 }
 
 QHeaderView::section {
@@ -142,6 +142,11 @@ QHeaderView::section:horizontal {
 }
 QHeaderView::section:horizontal:last {
     border-right: none;
+}
+
+QTableCornerButton::section {
+    background-color: #f8fafc;
+    border: 1px solid #e2e8f0;
 }
 
 /* --- 6. 滚动条 (ScrollBar) --- */
@@ -189,7 +194,7 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
 }
 
-/* --- 7. 美化特定的卡片标签 (特定于仪表盘的数据展示) --- */
+/* --- 7. 缇庡寲鐗瑰畾鐨勫崱鐗囨爣绛?(鐗瑰畾浜庝华琛ㄧ洏鐨勬暟鎹睍绀? --- */
 QLabel#DashValueLabel {
     color: #0f172a;
     font-size: 28px;
@@ -205,9 +210,11 @@ QLabel#DashIconLabel {
     background-color: #f1f5f9;
 }
 
-/* 底部时钟栏 */
+/* 搴曢儴鏃堕挓鏍?*/
 QLabel#BottomClock {
     background-color: transparent;
     color: #64748b;
     font-size: 12px;
 }
+
+/* =========================================================

@@ -62,6 +62,19 @@ class GroupMemberTableModel(QAbstractTableModel):
         self._data_cache = nodes
         self.endResetModel()
 
+    def update_nodes(self, dirty_ids):
+        if not dirty_ids or not self._data_cache:
+            return
+            
+        if not hasattr(self, '_row_map') or len(self._row_map) != len(self._data_cache):
+            self._row_map = {n.get('node_id'): i for i, n in enumerate(self._data_cache)}
+            
+        for nid in dirty_ids:
+            if nid in self._row_map:
+                row = self._row_map[nid]
+                # column 1 indicates Current Status
+                self.dataChanged.emit(self.index(row, 1), self.index(row, 1))
+
     def rowCount(self, parent=QModelIndex()):
         return len(self._data_cache)
 
@@ -454,11 +467,25 @@ class TabGroup(QWidget):
         group_id = curr.data(0, Qt.UserRole)
         name = curr.text(0)
 
-        rep = QMessageBox.question(self, "确认", f"确定要删除分组 {name} 及其所有子分组吗？\n(仅解散分组，不影响控制节点)", QMessageBox.Yes | QMessageBox.No)
+        # 获取子分组数量
+        child_count = curr.childCount()
+        child_info = f"（包含 {child_count} 个子分组）" if child_count > 0 else ""
+
+        rep = QMessageBox.question(
+            self, "确认删除分组",
+            f"确定要删除分组 【{name}】{child_info} 吗？\n\n"
+            f"此操作将同时：\n"
+            f"  • 删除该分组及其所有子分组\n"
+            f"  • 删除该分组关联的所有调度计划\n"
+            f"  • 控制节点本身不受影响\n\n"
+            f"此操作不可撤销！",
+            QMessageBox.Yes | QMessageBox.No
+        )
         if rep == QMessageBox.Yes:
             self.dm.pm.delete_group(group_id)
             global_logger.info(f"删除分组: '{name}'")
             self.refresh_groups_list()
+            self.refresh_schedules()
 
     def on_rename_group(self):
         curr = self.tree_groups.currentItem()
@@ -486,26 +513,40 @@ class TabGroup(QWidget):
             return
             
         try:
+            # 构建 id -> name 映射用于查找父分组名称
+            id_to_name = {g["id"]: g["name"] for g in groups}
+            
             export_rows = []
             for g in groups:
                 g_name = g["name"]
-                for full_id in g.get("nodes", []):
-                    # [V1.2.0 修订] 仅导出标识符的具体值内容，不含 ns=2;s= 前缀
-                    match = re.search(r';[isgb]=(.+)', full_id)
-                    short_id = match.group(1) if match else full_id
+                parent_name = id_to_name.get(g.get("parent_id"), "") if g.get("parent_id") else ""
+                
+                nodes = g.get("nodes", [])
+                if nodes:
+                    for full_id in nodes:
+                        # [V1.2.0 修订] 仅导出标识符的具体值内容，不含 ns=2;s= 前缀
+                        match = re.search(r';[isgb]=(.+)', full_id)
+                        short_id = match.group(1) if match else full_id
+                        export_rows.append({
+                            "分组名称": g_name,
+                            "父分组名称": parent_name,
+                            "节点标识": short_id
+                        })
+                else:
+                    # 导出空分组（仅保留层级关系）
                     export_rows.append({
                         "分组名称": g_name,
-                        "节点标识": short_id
+                        "父分组名称": parent_name,
+                        "节点标识": ""
                     })
             
             if not export_rows:
-                # 如果有空组但也想导出列名
-                df = pd.DataFrame(columns=["分组名称", "节点标识"])
+                df = pd.DataFrame(columns=["分组名称", "父分组名称", "节点标识"])
             else:
                 df = pd.DataFrame(export_rows)
                 
             df.to_excel(file_path, index=False)
-            QMessageBox.information(self, "导出成功", f"成功导出 {len(groups)} 个分组配置到 Excel。")
+            QMessageBox.information(self, "导出成功", f"成功导出 {len(groups)} 个分组配置到 Excel（包含层级关系）。")
         except Exception as e:
             global_logger.error(f"Failed to export Excel: {e}")
             QMessageBox.critical(self, "异常", f"导出失败: {e}")
@@ -522,6 +563,8 @@ class TabGroup(QWidget):
             if df.empty or "分组名称" not in df.columns or "节点标识" not in df.columns:
                 raise ValueError("Excel 格式不正确，必须包含 '分组名称' 和 '节点标识' 列。")
 
+            has_parent_col = "父分组名称" in df.columns
+
             # 获取当前系统中所有全量 ID 映射
             all_nodes = self.dm.get_node_list()
             id_map = {} # short_id/string_id -> full_id
@@ -533,45 +576,66 @@ class TabGroup(QWidget):
                 else:
                     id_map[full_id] = full_id # 兜底逻辑
 
-            imported_data = {} # group -> [full_ids]
+            # 第一步：收集分组名称 -> (父分组名称, [节点列表])
+            imported_data = {}  # group_name -> {"parent": parent_name, "nodes": [full_ids]}
             for _, row in df.iterrows():
                 g_name = str(row["分组名称"]).strip()
                 raw_id = str(row["节点标识"]).strip()
-                if not g_name or not raw_id: continue
-                clean_id = raw_id[:-2] if raw_id.endswith('.0') else raw_id
-                full_id = id_map.get(clean_id) or id_map.get(raw_id)
-                if full_id:
-                    if g_name not in imported_data:
-                        imported_data[g_name] = []
-                    imported_data[g_name].append(full_id)
+                parent_name = str(row["父分组名称"]).strip() if has_parent_col else ""
+                # 清理 nan
+                if parent_name.lower() == 'nan':
+                    parent_name = ""
+                if not g_name or g_name.lower() == 'nan':
+                    continue
 
-            current_groups = self.dm.pm.get_groups() # 这是一个列表了
+                if g_name not in imported_data:
+                    imported_data[g_name] = {"parent": parent_name, "nodes": []}
+
+                if raw_id and raw_id.lower() != 'nan':
+                    clean_id = raw_id[:-2] if raw_id.endswith('.0') else raw_id
+                    full_id = id_map.get(clean_id) or id_map.get(raw_id)
+                    if full_id:
+                        imported_data[g_name]["nodes"].append(full_id)
+
+            current_groups = self.dm.pm.get_groups()
+            # 构建名称 -> id 的映射（用于查找已存在分组和父分组）
+            name_to_id = {g["name"]: g["id"] for g in current_groups}
             imported_count = 0
-            
-            # 由于目前导入暂不处理树形层级（全部作为一级处理），为了向后兼容
-            for g_name, member_list in imported_data.items():
+
+            # 第二步：创建或合并分组，保留层级关系
+            for g_name, info in imported_data.items():
+                parent_name = info["parent"]
+                member_list = info["nodes"]
+
+                # 查找父分组 ID
+                parent_id = name_to_id.get(parent_name) if parent_name else None
+
                 target_g = None
                 for g in current_groups:
                     if g["name"] == g_name:
                         target_g = g
                         break
-                        
+
                 if target_g:
-                    # 并集去重合并 — 直接修改内存中的分组数据，最后统一保存
+                    # 并集去重合并
                     merged_members = list(set(target_g.get("nodes", []) + member_list))
                     target_g["nodes"] = merged_members
+                    # 如果原来无父分组但导入有父分组，更新层级
+                    if parent_id and not target_g.get("parent_id"):
+                        target_g["parent_id"] = parent_id
                 else:
                     new_id = str(uuid.uuid4())
                     new_group = {
                         "id": new_id,
                         "name": g_name,
-                        "parent_id": None,
+                        "parent_id": parent_id,
                         "nodes": member_list
                     }
                     self.dm.pm.data_store["groups"].append(new_group)
+                    name_to_id[g_name] = new_id  # 更新映射以供后续组引用
                 imported_count += 1
-                
-            # 批量操作完成后一次性持久化，避免 N 次磁盘 IO
+
+            # 批量操作完成后一次性持久化
             self.dm.pm.save()
             self.refresh_groups_list()
             QMessageBox.information(self, "导入成功", f"成功从 Excel 合并了 {imported_count} 个分组逻辑。")
@@ -667,7 +731,7 @@ class TabGroup(QWidget):
 
     def on_batch_control(self, action_val: bool):
         checked_group_ids = self._get_checked_group_ids()
-                
+
         if not checked_group_ids:
             # 向下兼容：如果没勾选，但选中了一行，也放行
             curr = self.tree_groups.currentItem()
@@ -676,29 +740,41 @@ class TabGroup(QWidget):
             else:
                 QMessageBox.warning(self, "未勾选组", "请先在左侧通过复选框勾选要控的分组。")
                 return
-            
+
         if not self.engine.connected:
             QMessageBox.warning(self, "连接中断", "OPC 服务掉线，请前往设置重连。")
             return
-            
+
         combined_member_ids = set()
         display_names = []
         for group_id in checked_group_ids:
             # 递归获取成员
             members = self.dm.pm.get_group_nodes_recursive(group_id)
             combined_member_ids.update(members)
-            
+
             g_obj = self.dm.pm.get_group_by_id(group_id)
             if g_obj: display_names.append(g_obj["name"])
-        
+
         if not combined_member_ids:
             QMessageBox.information(self, "空组", "当前指定的分组（及其子组）内没有任何控制点。")
             return
-            
-        # 并发发送写入指令前作好全量日志记录
+
+        # 确认对话框
         action_name = '全开' if action_val else '全关'
-        global_logger.info(f"==> 用户点击了批量 {action_name} 操作 | 受影响的分组: {', '.join(display_names)} | 受影响总节点数: {len(combined_member_ids)}")
-        
+        confirmed = QMessageBox.question(
+            self, "确认批量操作",
+            f"确定要对以下分组执行【{action_name}】操作吗？\n\n"
+            f"分组: {', '.join(display_names)}\n"
+            f"影响节点数: {len(combined_member_ids)}\n\n"
+            f"此操作将{'开启' if action_val else '关闭'}所有相关联的点位，请确认。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirmed != QMessageBox.Yes:
+            return
+
+        # 并发发送写入指令前作好全量日志记录
+        global_logger.info(f"==> 用户确认了批量 {action_name} 操作 | 受影响的分组: {', '.join(display_names)} | 受影响总节点数: {len(combined_member_ids)}")
+
         # 方案B：使用 WriteList 批量写入，大幅减少 RTT
         async def _batch_write():
             member_list = list(combined_member_ids)
@@ -713,22 +789,25 @@ class TabGroup(QWidget):
         asyncio.create_task(_batch_write())
 
     def refresh_schedules(self):
+        # 保存滚动位置
+        scroll_pos = self.table_sched.verticalScrollBar().value()
+
         self.table_sched.setRowCount(0)
         schedules = self.dm.pm.get_schedules()
         for s in schedules:
             row = self.table_sched.rowCount()
             self.table_sched.insertRow(row)
-            
+
             self.table_sched.setItem(row, 0, QTableWidgetItem(s.get("id", "")))
-            
+
             # 查找分组名称
             g_id = s.get("group_id")
             g_obj = self.dm.pm.get_group_by_id(g_id)
             g_name = g_obj.get("name") if g_obj else f"未知分组({g_id})"
-            
+
             self.table_sched.setItem(row, 1, QTableWidgetItem(g_name))
             self.table_sched.setItem(row, 2, QTableWidgetItem(s.get("time", "")))
-            
+
             # 显示日期
             week_data = s.get("weekdays")
             if week_data is None:
@@ -740,23 +819,26 @@ class TabGroup(QWidget):
             else:
                 days_map = {0:"一", 1:"二", 2:"三", 3:"四", 4:"五", 5:"六", 6:"日"}
                 week_text = ",".join([days_map[d] for d in sorted(week_data)])
-            
+
             self.table_sched.setItem(row, 3, QTableWidgetItem(week_text))
-            
+
             action_text = "开启" if s.get("action") else "关闭"
             self.table_sched.setItem(row, 4, QTableWidgetItem(action_text))
-            
+
             is_enabled = s.get("enabled", True)
             btn_status = QPushButton("🟢 已开启" if is_enabled else "🔴 已关闭")
             if is_enabled:
                 btn_status.setStyleSheet("QPushButton { color: white; background-color: #10b981; border-radius: 6px; border: none; padding: 4px; } QPushButton:hover { background-color: #34d399; }")
             else:
                 btn_status.setStyleSheet("QPushButton { color: white; background-color: #94a3b8; border-radius: 6px; border: none; padding: 4px; } QPushButton:hover { background-color: #cbd5e1; }")
-                
+
             # 闭包绑定当前id和前状态
             btn_status.clicked.connect(lambda chk, _id=s.get("id"), curr=is_enabled: self.on_toggle_schedule(_id, curr))
-            
+
             self.table_sched.setCellWidget(row, 5, btn_status)
+
+        # 恢复滚动位置
+        self.table_sched.verticalScrollBar().setValue(scroll_pos)
             
     def on_toggle_schedule(self, sched_id, current_status):
         new_status = not current_status
