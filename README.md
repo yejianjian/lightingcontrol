@@ -1,10 +1,10 @@
-# Lighting Control System (灯光控制系统) V1.1.0
+# Lighting Control System (灯光控制系统) V1.2.3beta
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen.svg)
 ![Framework](https://img.shields.io/badge/framework-PyQt5%20%2F%20PySide6-orange.svg)
 
-这是一个基于 Python 开发的专业灯光控制系统，支持通过 **OPC UA/DA** 协议与工业自动化设备进行通信。系统集成了实时监控、分组控制、定时任务调度以及智能报警功能。
+这是一个基于 Python 开发的专业灯光控制系统，针对 OPC UA 协议进行了深度优化。系统集成了实时监控、分组控制、定时任务调度以及智能报警功能。
 
 ## 🌟 核心功能与技术亮点
 
@@ -26,7 +26,7 @@
 ```text
 lightingcontrol/
 ├── core/               # 核心逻辑：计划任务、数据持久化管理
-├── opc/                # 通信引擎：OPC UA/DA 客户端实现
+├── opc/                # 通信引擎：OPC UA 客户端实现
 ├── ui/                 # 界面组件：PyQt 窗口与自定义控件
 ├── data/               # 配置存储
 ├── utils/              # 通用工具：日志记录、时间转换
@@ -36,19 +36,23 @@ lightingcontrol/
 ## 🚀 快速开始
 
 ### 1. 环境准备
+
 确保已安装 Python 3.8 或更高版本。
 
 ### 2. 安装依赖
+
 ```bash
 pip install -r requirements.txt
 ```
 *(注：主要依赖包括 `asyncua`, `PyQt5`, `qasync`, `cryptography` 等)*
 
 ### 3. 配置连接
+
 - 本系统首次连接 OPC UA 服务器时会自动生成客户端证书 (`client_cert.der`)。
 - 请确保将服务器证书放置在根目录下（或根据提示导入）。
 
 ### 4. 运行
+
 ```bash
 python main.py
 ```
