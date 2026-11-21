@@ -2,7 +2,7 @@ try:
     from PyQt5.QtWidgets import (
         QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTabWidget, QLabel, QFrame, QMessageBox, QInputDialog, QLineEdit,
-        QSystemTrayIcon, QMenu, QAction
+        QSystemTrayIcon, QMenu, QAction, QApplication
     )
     from PyQt5.QtCore import Qt, pyqtSignal, QTimer
     from PyQt5.QtGui import QIcon
@@ -10,7 +10,7 @@ except ImportError:
     from PySide6.QtWidgets import (
         QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTabWidget, QLabel, QFrame, QMessageBox, QInputDialog, QLineEdit,
-        QSystemTrayIcon, QMenu, QAction
+        QSystemTrayIcon, QMenu, QAction, QApplication
     )
     from PySide6.QtCore import Qt, Signal as pyqtSignal, QTimer
     from PySide6.QtGui import QIcon
@@ -21,7 +21,7 @@ from opc.client_engine import OpcClientEngine
 from core.data_manager import DataManager
 from utils.logger import global_logger
 from utils.persistence import PersistenceManager
-from utils.paths import get_base_path
+from utils.paths import get_resource_path
 from ui.tabs.tab_monitor import TabMonitor
 from ui.tabs.tab_group import TabGroup
 from ui.tabs.tab_settings import TabSettings
@@ -29,16 +29,55 @@ from ui.tabs.tab_logs import TabLogs
 from core.group_scheduler import GroupScheduler
 
 class MainWindow(QMainWindow):
+    # 协议/引擎插槽：默认 OPC UA；OPC DA 版本通过子类替换这两个类属性，
+    # 其余页面（监控、分组、日志、调度）只依赖引擎的公共接口，完全复用。
+    ENGINE_CLASS = OpcClientEngine
+    SETTINGS_CLASS = TabSettings
+
+    # 最小窗口尺寸：必须低于 1024x768 屏幕的可用高度（减去任务栏约 40px），
+    # 否则用户在全屏下也看不到底部内容（这是之前"界面太大"的直接原因）。
+    MIN_WINDOW_WIDTH = 860
+    MIN_WINDOW_HEIGHT = 520
+
+    def _apply_adaptive_geometry(self):
+        """按可用屏幕计算初始窗口尺寸，并设置不会撑破屏幕的最小尺寸。"""
+        try:
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen else None
+        except Exception:
+            avail = None
+
+        if avail is None or avail.width() <= 0 or avail.height() <= 0:
+            self.resize(1100, 720)
+            self.setMinimumSize(self.MIN_WINDOW_WIDTH, self.MIN_WINDOW_HEIGHT)
+            return
+
+        # 留出 20px 边距，避免紧贴屏幕边缘
+        target_w = min(1100, max(640, avail.width() - 20))
+        target_h = min(750, max(480, avail.height() - 20))
+        self.resize(target_w, target_h)
+        self.setMinimumSize(
+            min(self.MIN_WINDOW_WIDTH, target_w),
+            min(self.MIN_WINDOW_HEIGHT, target_h),
+        )
+        global_logger.info(
+            f"Screen available {avail.width()}x{avail.height()}; window {target_w}x{target_h}, "
+            f"minimum {self.minimumWidth()}x{self.minimumHeight()}"
+        )
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("灯光自动控制系统 V1.2.3beta")
-        # 宽屏比例适配
-        self.resize(1100, 750)
-        
+        self.setWindowTitle("灯光自动控制系统 V1.4.0")
+
+        # 依据可用屏幕自适应初始尺寸。
+        # 现场既有 1366x768 也有 1024x768 甚至更小的老屏，固定 resize(1100,750)
+        # 在 768 高的屏幕上会被任务栏挤掉底部内容。
+        self._apply_adaptive_geometry()
+
         # 挂载我们生成的应用 Logo
         import os
         
-        base_path = get_base_path()
+        base_path = get_resource_path()
             
         logo_path = os.path.join(base_path, "lighting_logo.png")
         if os.path.exists(logo_path):
@@ -47,7 +86,7 @@ class MainWindow(QMainWindow):
         # 核心数据与引擎
         self.pm = PersistenceManager()
         self.dm = DataManager(self.pm)
-        self.opc_engine = OpcClientEngine()  # 参数由设置页注入
+        self.opc_engine = self.ENGINE_CLASS()  # 参数由设置页注入
 
         # 检查配置文件是否损坏
         if self.pm.was_load_corrupted():
@@ -61,7 +100,13 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._apply_qss()
         self._bind_events()
-        global_logger.info("MainWindow initialized with QTabWidget architecture.")
+        # 布局构建完成后再压低窗口的最小尺寸下限：内容的最小尺寸提示可能大于屏幕，
+        # 这里显式放开，让用户能把窗口缩小到屏幕以内（配合各页的滚动区域）。
+        self._relax_minimum_size()
+        global_logger.info(
+            f"MainWindow initialized. size={self.width()}x{self.height()}, "
+            f"minimum={self.minimumWidth()}x{self.minimumHeight()}"
+        )
 
         # 自动连接
         if self.pm.data_store.get("auto_connect", False):
@@ -72,6 +117,36 @@ class MainWindow(QMainWindow):
         # 应用保存的主题
         if self.pm.data_store.get("dark_mode", False):
             QTimer.singleShot(100, lambda: self._apply_theme(True))
+
+    def _relax_minimum_size(self):
+        """把窗口最小尺寸压到不超过屏幕可用区域。
+
+        Qt 会把"内容最小尺寸提示"合并进窗口的最小尺寸。当某个页面的控件天然较宽
+        （例如成员穿梭表的筛选行）时，窗口最小尺寸会超过屏幕，用户即便全屏也看不到
+        底部内容。这里用显式 setMinimumSize 覆盖该下限，并让中心控件可被压缩。
+        """
+        try:
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen else None
+        except Exception:
+            avail = None
+
+        max_w = avail.width() - 16 if avail else self.MIN_WINDOW_WIDTH
+        max_h = avail.height() - 16 if avail else self.MIN_WINDOW_HEIGHT
+        min_w = max(640, min(self.MIN_WINDOW_WIDTH, max_w))
+        min_h = max(480, min(self.MIN_WINDOW_HEIGHT, max_h))
+
+        central = self.centralWidget()
+        if central is not None:
+            central.setMinimumSize(0, 0)
+        if hasattr(self, 'tabs'):
+            self.tabs.setMinimumSize(0, 0)
+        self.setMinimumSize(min_w, min_h)
+
+        # 若当前尺寸已超出屏幕，主动收缩
+        if avail is not None:
+            if self.width() > max_w or self.height() > max_h:
+                self.resize(min(self.width(), max_w), min(self.height(), max_h))
 
     def _apply_theme(self, dark_mode):
         """应用主题到主窗口"""
@@ -130,13 +205,19 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
         self.setStyleSheet(qss)
 
     def _do_auto_connect(self):
-        """执行自动连接"""
+        """执行自动连接。
+
+        绝不能走 ``on_connect_clicked()``：那个槽把"处于 reconnecting 状态时的点击"
+        解释为**用户想停止自动重连**。启动时自动重连总闸已经打开，500ms 后的这次
+        自动连接会被当成用户按下了停止键，导致 `_auto_reconnect` 被关掉、复选框却
+        还勾着 —— 之后真断线时只会停在"待连接"。
+        """
         if hasattr(self, 'tab_settings'):
-            self.tab_settings.on_connect_clicked()
+            self.tab_settings.start_auto_connect()
 
     def _apply_qss(self):
         import os
-        base_path = get_base_path()
+        base_path = get_resource_path()
         qss_path = os.path.join(base_path, "ui", "style.qss")
         self._original_qss = ""
         if os.path.exists(qss_path):
@@ -201,7 +282,7 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
         self.tabs.addTab(self.tab_group, "分组与调度")
 
         # 3. 设置与连接
-        self.tab_settings = TabSettings(self.opc_engine, self.dm)
+        self.tab_settings = self.SETTINGS_CLASS(self.opc_engine, self.dm)
         self.tabs.addTab(self.tab_settings, "设置")
 
         # 4. 实时日志
@@ -262,6 +343,36 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
         self.clock_timer.start(1000)
 
     def _on_refresh_timer(self):
+        # 兜底自愈：OPC 引擎的链路健康心跳/轮询任务如果静默退出（或僵尸 pending），
+        # 由 UI 刷新定时器负责补拉它们。必须放在"无脏节点直接 return"之前，
+        # 否则画面静止时（灯光点位长时间不变）这条兜底路径永远不会执行。
+        ensure_liveness = getattr(self.opc_engine, "ensure_liveness", None)
+        if callable(ensure_liveness):
+            try:
+                ensure_liveness()
+            except Exception as e:
+                # 兜底逻辑失败绝不能影响界面刷新
+                global_logger.debug(f"ensure_liveness() failed (non-fatal): {e}")
+
+        # 调度器看门狗：调度守护协程如果静默退出/变成僵尸 pending，定时任务会
+        # 永远不再触发（界面与连接都正常，极难排查）。UI 刷新定时器负责兜底重启。
+        ensure_scheduler = getattr(getattr(self, "scheduler", None), "ensure_running", None)
+        if callable(ensure_scheduler):
+            try:
+                ensure_scheduler()
+            except Exception as e:
+                global_logger.debug(f"scheduler.ensure_running() failed (non-fatal): {e}")
+
+        # 心跳存活状态上屏：心跳成功日志是 DEBUG 级，默认日志页看不到；
+        # 设置页链路状态需要实时显示"心跳 Xs 前"，便于现场确认检测在运行。
+        update_heartbeat = getattr(getattr(self, "tab_settings", None),
+                                   "update_heartbeat_status", None)
+        if callable(update_heartbeat):
+            try:
+                update_heartbeat()
+            except Exception as e:
+                global_logger.debug(f"update_heartbeat_status() failed (non-fatal): {e}")
+
         # 原子地获取脏节点，避免与订阅回调产生竞态
         dirty_nodes = self.dm.get_dirty_nodes_and_clear()
         if not dirty_nodes and not self.dm.structure_changed:
@@ -290,7 +401,7 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
     def _create_tray_icon(self):
         """创建系统托盘图标和菜单"""
         import os
-        base_path = get_base_path()
+        base_path = get_resource_path()
         icon_path = os.path.join(base_path, "lighting_logo.png")
 
         self.tray_icon = QSystemTrayIcon(self)
@@ -366,24 +477,36 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
             # 停止调度器
             if hasattr(self, 'scheduler'):
                 self.scheduler.stop()
-            # 断开 OPC 连接 — 使用 ensure_future 避免 run_until_complete 死锁
-            if self.opc_engine.connected:
-                try:
-                    disconnect_future = asyncio.ensure_future(self.opc_engine.disconnect())
-                    # 断连完成后再停止事件循环
-                    def _on_disconnect_done(fut):
-                        try:
-                            loop = asyncio.get_event_loop()
-                            loop.stop()
-                        except Exception:
-                            pass
-                    disconnect_future.add_done_callback(_on_disconnect_done)
-                except Exception as e:
-                    global_logger.warning(f"Error during shutdown disconnect: {e}")
-                    # 断连失败时仍需停止事件循环
-                    QTimer.singleShot(500, lambda: self._stop_event_loop())
-            else:
-                # 未连接时直接停止事件循环
+            # 关闭自动重连总闸：否则关闭流程中 supervisor 可能又把连接拉起来
+            try:
+                self.opc_engine.stop_reconnect()
+            except Exception as e:
+                global_logger.warning(f"Error stopping reconnect supervisor: {e}")
+            # 断开 OPC 连接 — 使用 ensure_future 避免 run_until_complete 死锁。
+            # 无论当前是否"已连接"都要走一遍：断开是幂等的，且重连中/加载中同样需要收尾。
+            try:
+                disconnect_future = asyncio.ensure_future(self.opc_engine.disconnect())
+                self._shutdown_disconnect_future = disconnect_future
+
+                def _on_disconnect_done(fut):
+                    try:
+                        if not fut.cancelled():
+                            exc = fut.exception()
+                            if exc is not None:
+                                global_logger.warning(f"Disconnect during shutdown raised: {exc}")
+                    except Exception:
+                        pass
+                    self._stop_event_loop()
+
+                disconnect_future.add_done_callback(_on_disconnect_done)
+                # 兜底：即使 disconnect 因底层驱动异常没能返回，也在 5 秒后强制收尾
+                self._shutdown_watchdog = QTimer(self)
+                self._shutdown_watchdog.setSingleShot(True)
+                self._shutdown_watchdog.timeout.connect(self._stop_event_loop)
+                self._shutdown_watchdog.start(5000)
+            except Exception as e:
+                global_logger.warning(f"Error during shutdown disconnect: {e}")
+                # 断连失败时仍需停止事件循环
                 QTimer.singleShot(500, lambda: self._stop_event_loop())
 
             event.accept()

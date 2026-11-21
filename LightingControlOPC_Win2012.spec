@@ -1,4 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+# 单文件打包配置（Windows Server 2012 目标）。
+# EXE() 里直接传入 a.binaries / a.datas 即为 onefile 模式；数据文件运行时解压到
+# sys._MEIPASS（只读资源），可写数据（证书、配置、日志）由 utils.paths.get_app_path()
+# 放在 exe 同级目录，保证重启后仍然存在。
 import os
 
 # 数据文件
@@ -27,7 +31,9 @@ a = Analysis(
     pathex=[],
     binaries=binaries,
     datas=datas,
-    hiddenimports=['qasync', 'asyncqt', 'PyQt5', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets', 'PyQt5.sip'],
+    # 只列真正需要但静态分析看不到的模块。'asyncqt' 是 qasync 的旧前身，本项目
+    # 未使用；把它写进 hiddenimports 只会在每次构建时产生 "Hidden import not found"。
+    hiddenimports=['qasync', 'PyQt5', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets', 'PyQt5.sip', 'ctypes', 'ctypes.wintypes', 'utils.security'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -43,7 +49,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LightingControl_v1.2.3beta',
+    name='LightingControl_v1.4.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

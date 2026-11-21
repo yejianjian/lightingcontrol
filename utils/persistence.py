@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import uuid
+import threading
 from contextlib import contextmanager
 from utils.logger import global_logger
 
@@ -20,6 +21,7 @@ class PersistenceManager:
         if not os.path.isabs(data_file):
             data_file = os.path.join(_get_base_dir(), data_file)
         self.data_file = data_file
+        self._lock = threading.RLock()  # 线程安全的互斥锁，防止并发写冲突与文件截断
         self._batch_count = 0  # 批量模式嵌套计数
         self._load_failed = False  # 标记配置文件是否全部加载失败
         self._groups_index = {}     # id -> group_obj 索引
@@ -33,109 +35,166 @@ class PersistenceManager:
 
     def load(self):
         """将本地磁盘的数据反序列化到内存，加载失败时尝试从备份恢复"""
-        loaded = False
-        for path in [self.data_file, self.data_file + ".bak"]:
-            if os.path.exists(path):
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    # 结构校验：确保核心 key 存在
-                    for key in ("aliases", "groups", "schedules"):
-                        if key not in data:
-                            data[key] = self.data_store[key]
-                    self.data_store.update(data)
-                    
-                    # --- 数据迁移逻辑 (由平级字典迁移至树形列表) ---
-                    if isinstance(self.data_store["groups"], dict):
-                        global_logger.info("Migrating legacy flat group dictionary to hierarchical list...")
-                        old_groups = self.data_store["groups"]
-                        new_groups = []
-                        name_to_id_map = {}
+        with self._lock:
+            loaded = False
+            for path in [self.data_file, self.data_file + ".bak"]:
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        # 结构校验：确保核心 key 存在
+                        for key in ("aliases", "groups", "schedules"):
+                            if key not in data:
+                                data[key] = self.data_store[key]
+                        self.data_store.update(data)
                         
-                        # 转换分组
-                        for g_name, nodes in old_groups.items():
-                            g_id = str(uuid.uuid4())
-                            name_to_id_map[g_name] = g_id
-                            new_groups.append({
-                                "id": g_id,
-                                "name": g_name,
-                                "parent_id": None,
-                                "nodes": nodes
-                            })
-                        self.data_store["groups"] = new_groups
+                        # --- 数据迁移逻辑 (由平级字典迁移至树形列表) ---
+                        if isinstance(self.data_store["groups"], dict):
+                            global_logger.info("Migrating legacy flat group dictionary to hierarchical list...")
+                            old_groups = self.data_store["groups"]
+                            new_groups = []
+                            name_to_id_map = {}
+                            
+                            # 转换分组
+                            for g_name, nodes in old_groups.items():
+                                g_id = str(uuid.uuid4())
+                                name_to_id_map[g_name] = g_id
+                                new_groups.append({
+                                    "id": g_id,
+                                    "name": g_name,
+                                    "parent_id": None,
+                                    "nodes": nodes
+                                })
+                            self.data_store["groups"] = new_groups
+                            
+                            # 修正调度计划关联（由名称关联改为 ID 关联）
+                            for sched in self.data_store["schedules"]:
+                                old_g_name = sched.get("group")
+                                if old_g_name in name_to_id_map:
+                                    sched["group_id"] = name_to_id_map[old_g_name]
+                                    # 兼容性：保留 group 字段用于显示，新增 group_id 用于逻辑
+                            
+                            self.save()
+                            global_logger.info("Data migration completed successfully.")
+                        # ---------------------------------------------
                         
-                        # 修正调度计划关联（由名称关联改为 ID 关联）
-                        for sched in self.data_store["schedules"]:
-                            old_g_name = sched.get("group")
-                            if old_g_name in name_to_id_map:
-                                sched["group_id"] = name_to_id_map[old_g_name]
-                                # 兼容性：保留 group 字段用于显示，新增 group_id 用于逻辑
-                        
-                        self.save()
-                        global_logger.info("Data migration completed successfully.")
-                    # ---------------------------------------------
-                    
-                    loaded = True
-                    if path != self.data_file:
-                        global_logger.warning(f"Primary config corrupted, restored from backup: {path}")
-                    else:
-                        global_logger.info(f"Successfully loaded configuration from {path}")
-                    self._rebuild_index()
-                    break
-                except Exception as e:
-                    global_logger.error(f"Failed to load configuration from {path}: {e}")
-        if not loaded:
-            # 检查是文件不存在还是文件损坏
-            primary_exists = os.path.exists(self.data_file)
-            backup_exists = os.path.exists(self.data_file + ".bak")
-            if primary_exists or backup_exists:
-                # 文件存在但加载失败（损坏）
-                self._load_failed = True
-                global_logger.error(f"Configuration files corrupted. Both primary and backup failed to load.")
-            else:
-                global_logger.info(f"{self.data_file} not found. A new one will be created upon saving.")
+                        loaded = True
+                        if path != self.data_file:
+                            global_logger.warning(f"Primary config corrupted, restored from backup: {path}")
+                            # 立刻用恢复出来的内容重写主文件与备份，避免"损坏的主文件"
+                            # 一直躺在那儿，在后续某次保存中把好备份覆盖掉
+                            self._quarantine_corrupt_primary()
+                            self.save()
+                        else:
+                            global_logger.info(f"Successfully loaded configuration from {path}")
+                        self._rebuild_index()
+                        break
+                    except Exception as e:
+                        global_logger.error(f"Failed to load configuration from {path}: {e}")
+            if not loaded:
+                # 检查是文件不存在还是文件损坏
+                primary_exists = os.path.exists(self.data_file)
+                backup_exists = os.path.exists(self.data_file + ".bak")
+                if primary_exists or backup_exists:
+                    # 文件存在但加载失败（损坏）
+                    self._load_failed = True
+                    global_logger.error(f"Configuration files corrupted. Both primary and backup failed to load.")
+                else:
+                    global_logger.info(f"{self.data_file} not found. A new one will be created upon saving.")
+
+    def _quarantine_corrupt_primary(self):
+        """把无法解析的主文件改名保留，避免它被当作"上一份好配置"轮换进备份。"""
+        if not os.path.exists(self.data_file):
+            return
+        corrupt_path = f"{self.data_file}.corrupt"
+        try:
+            os.replace(self.data_file, corrupt_path)
+            global_logger.warning(
+                f"Corrupt primary config preserved as {os.path.basename(corrupt_path)} for inspection."
+            )
+        except OSError as e:
+            global_logger.warning(f"Could not preserve the corrupt primary config: {e}")
 
     @contextmanager
     def batch_mode(self):
         """批量操作上下文：期间所有 save() 调用被抑制，退出时统一保存一次"""
-        self._batch_count += 1
+        with self._lock:
+            self._batch_count += 1
         try:
             yield
         finally:
-            self._batch_count -= 1
-            if self._batch_count == 0:
+            with self._lock:
+                self._batch_count -= 1
+                should_save = (self._batch_count == 0)
+            if should_save:
                 self.save()
 
     def save(self):
-        """原子写入：先写临时文件再替换，防止断电导致文件损坏"""
-        if self._batch_count > 0:
-            return  # 批量模式下跳过，等 batch_mode 退出时统一保存
-        os.makedirs(os.path.dirname(self.data_file) or '.', exist_ok=True)
-        tmp_file = self.data_file + ".tmp"
-        try:
-            with open(tmp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.data_store, f, ensure_ascii=False, indent=2)
-            # 成功写入后，创建备份并替换原文件
-            if os.path.exists(self.data_file):
-                bak_file = self.data_file + ".bak"
+        """原子写入：先写临时文件、fsync 落盘，再替换，防止断电或并发导致文件损坏。
+
+        备份轮换顺序很关键：必须先确认新内容已经完整落盘，再把旧主文件转成备份。
+        原实现是"先把旧主文件挪成备份，再把临时文件改名为主文件"——如果上一次加载
+        就是因为主文件损坏而回退到备份，这一步会把**已知损坏的主文件**覆盖到唯一
+        可用的备份上；若此时断电或改名失败（Windows 上杀软/索引器占用很常见），
+        就会同时失去主文件与备份，下次启动直接变成空配置（别名/分组/计划全丢）。
+        """
+        with self._lock:
+            if self._batch_count > 0:
+                return  # 批量模式下跳过，等 batch_mode 退出时统一保存
+            data_dir = os.path.dirname(self.data_file) or '.'
+            try:
+                os.makedirs(data_dir, exist_ok=True)
+            except OSError:
+                pass
+            # 临时文件名带进程号，避免两个实例互相覆盖同一个 tmp 文件
+            tmp_file = f"{self.data_file}.{os.getpid()}.tmp"
+            try:
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.data_store, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        # 某些网络盘/虚拟盘不支持 fsync，退化为 flush 即可
+                        pass
+
+                # 1) 先把新内容就位（此刻主文件仍完好，最坏情况不丢数据）
+                os.replace(tmp_file, self.data_file)
+
+                # 2) 主文件已更新成功，再把新主文件复制为备份。
+                #    注意用 copy 而不是 rename：rename 会让主文件短暂不存在，
+                #    崩溃窗口内同样会"主备皆失"。
                 try:
-                    # 使用 os.replace 替代 os.rename，前者在 Windows 上也能原子覆盖
-                    os.replace(self.data_file, bak_file)
+                    self._rotate_backup()
                 except OSError:
                     pass  # 备份失败不阻塞主流程
-            os.replace(tmp_file, self.data_file)
-            # 保存成功后清除损坏标记
-            self._load_failed = False
-            global_logger.debug(f"Configuration saved to {self.data_file}")
-            self._rebuild_index()
-        except Exception as e:
-            global_logger.error(f"Failed to save configuration: {e}")
-            # 清理可能残留的临时文件
-            if os.path.exists(tmp_file):
-                try:
-                    os.remove(tmp_file)
-                except OSError:
-                    pass
+
+                self._load_failed = False
+                global_logger.debug(f"Configuration saved to {self.data_file}")
+                self._rebuild_index()
+            except Exception as e:
+                global_logger.error(f"Failed to save configuration: {e}")
+                # 清理可能残留的临时文件
+                if os.path.exists(tmp_file):
+                    try:
+                        os.remove(tmp_file)
+                    except OSError:
+                        pass
+
+    def _rotate_backup(self):
+        """把当前主文件复制为 .bak（保留上一份，用于损坏时回退）。"""
+        if not os.path.exists(self.data_file):
+            return
+        bak_file = self.data_file + ".bak"
+        tmp_bak = bak_file + ".tmp"
+        with open(self.data_file, 'rb') as src, open(tmp_bak, 'wb') as dst:
+            dst.write(src.read())
+            dst.flush()
+            try:
+                os.fsync(dst.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_bak, bak_file)
 
     def was_load_corrupted(self) -> bool:
         """检查配置文件是否在加载时损坏（主文件和备份都损坏）"""
@@ -143,92 +202,107 @@ class PersistenceManager:
 
     # --- 别名 (Alias/Remark) API ---
     def get_all_aliases(self) -> dict:
-        return self.data_store.get("aliases", {})
+        with self._lock:
+            return dict(self.data_store.get("aliases", {}))
         
     def set_alias(self, node_id: str, alias: str):
-        self.data_store["aliases"][node_id] = alias
-        self.save()
+        with self._lock:
+            self.data_store["aliases"][node_id] = alias
+            self.save()
         
     def batch_set_aliases(self, alias_dict: dict):
         """批量导入用"""
-        self.data_store["aliases"].update(alias_dict)
-        self.save()
+        with self._lock:
+            self.data_store["aliases"].update(alias_dict)
+            self.save()
 
     # --- Group API (多级分组管理) ---
     def get_groups(self) -> list:
-        """返回分组列表对象"""
-        return self.data_store.get("groups", [])
+        """返回分组列表对象（快照复制）"""
+        with self._lock:
+            return [dict(g) for g in self.data_store.get("groups", [])]
 
     def add_group(self, group_name: str, parent_id: str = None) -> str:
         """添加分组，返回新分组的 ID"""
-        new_id = str(uuid.uuid4())
-        new_group = {
-            "id": new_id,
-            "name": group_name,
-            "parent_id": parent_id,
-            "nodes": []
-        }
-        self.data_store["groups"].append(new_group)
-        self.save()
-        return new_id
+        with self._lock:
+            new_id = str(uuid.uuid4())
+            new_group = {
+                "id": new_id,
+                "name": group_name,
+                "parent_id": parent_id,
+                "nodes": []
+            }
+            self.data_store["groups"].append(new_group)
+            self.save()
+            return new_id
         
     def rename_group(self, group_id: str, new_name: str) -> bool:
-        for g in self.data_store["groups"]:
-            if g["id"] == group_id:
-                g["name"] = new_name
-                self.save()
-                return True
-        return False
+        with self._lock:
+            for g in self.data_store["groups"]:
+                if g["id"] == group_id:
+                    g["name"] = new_name
+                    self.save()
+                    return True
+            return False
         
     def delete_group(self, group_id: str):
         """删除分组及其所有子分组"""
-        to_delete = {group_id}
-        
-        # 递归寻找子孙
-        def find_descendants(pid):
-            for g in self.data_store["groups"]:
-                if g["parent_id"] == pid:
-                    to_delete.add(g["id"])
-                    find_descendants(g["id"])
-                    
-        find_descendants(group_id)
-        
-        # 批量过滤
-        self.data_store["groups"] = [g for g in self.data_store["groups"] if g["id"] not in to_delete]
-        # 同时清理关联的调度计划
-        self.data_store["schedules"] = [s for s in self.data_store["schedules"] if s.get("group_id") not in to_delete]
-        
-        self.save()
-        return True
+        with self._lock:
+            to_delete = {group_id}
+            
+            # 递归寻找子孙（带 visited 防护，避免手改 JSON 产生的 parent_id 环导致栈溢出）
+            def find_descendants(pid, visited=None):
+                if visited is None:
+                    visited = set()
+                if pid in visited:
+                    return
+                visited.add(pid)
+                for g in self.data_store["groups"]:
+                    if g["parent_id"] == pid:
+                        to_delete.add(g["id"])
+                        find_descendants(g["id"], visited)
+                        
+            find_descendants(group_id)
+            
+            # 批量过滤
+            self.data_store["groups"] = [g for g in self.data_store["groups"] if g["id"] not in to_delete]
+            # 同时清理关联的调度计划
+            self.data_store["schedules"] = [s for s in self.data_store["schedules"] if s.get("group_id") not in to_delete]
+            
+            self.save()
+            return True
         
     def update_group_members(self, group_id: str, node_ids: list):
-        for g in self.data_store["groups"]:
-            if g["id"] == group_id:
-                g["nodes"] = node_ids
-                self.save()
-                return True
-        return False
+        with self._lock:
+            for g in self.data_store["groups"]:
+                if g["id"] == group_id:
+                    g["nodes"] = list(node_ids)
+                    self.save()
+                    return True
+            return False
 
     def get_group_nodes_recursive(self, group_id: str) -> set:
         """递归获取当前组及其所有子孙组关联的 OPC 节点 ID 集合"""
-        all_node_ids = set()
-        visited = set()
-        
-        def collect(gid):
-            if gid in visited:
-                return
-            visited.add(gid)
-            for g in self.data_store["groups"]:
-                if g["id"] == gid:
-                    all_node_ids.update(g.get("nodes", []))
-                if g["parent_id"] == gid:
-                    collect(g["id"])
-                    
-        collect(group_id)
-        return all_node_ids
+        with self._lock:
+            all_node_ids = set()
+            visited = set()
+            
+            def collect(gid):
+                if gid in visited:
+                    return
+                visited.add(gid)
+                for g in self.data_store["groups"]:
+                    if g["id"] == gid:
+                        all_node_ids.update(g.get("nodes", []))
+                    if g["parent_id"] == gid:
+                        collect(g["id"])
+                        
+            collect(group_id)
+            return all_node_ids
 
     def get_group_by_id(self, group_id: str):
-        return self._groups_index.get(group_id)
+        with self._lock:
+            return self._groups_index.get(group_id)
 
     def _rebuild_index(self):
         """重建 groups 和 schedules 的 O(1) 查找索引"""
@@ -237,34 +311,40 @@ class PersistenceManager:
 
     # --- Schedule API (调度器预留) ---
     def get_schedules(self):
-        return self.data_store.get("schedules", [])
+        with self._lock:
+            return [dict(s) for s in self.data_store.get("schedules", [])]
 
     def get_schedule_by_id(self, sched_id):
-        return self._schedules_index.get(sched_id)
+        with self._lock:
+            return self._schedules_index.get(sched_id)
 
     def add_schedule(self, schedule_dict):
         """传入字典包含: id, group_id, time(HH:MM), action(bool), enabled"""
-        if "schedules" not in self.data_store:
-            self.data_store["schedules"] = []
-        self.data_store["schedules"].append(schedule_dict)
-        self.save()
+        with self._lock:
+            if "schedules" not in self.data_store:
+                self.data_store["schedules"] = []
+            self.data_store["schedules"].append(schedule_dict)
+            self.save()
         
     def delete_schedule(self, sched_id):
-        schedules = self.data_store.get("schedules", [])
-        self.data_store["schedules"] = [s for s in schedules if s.get("id") != sched_id]
-        self.save()
+        with self._lock:
+            schedules = self.data_store.get("schedules", [])
+            self.data_store["schedules"] = [s for s in schedules if s.get("id") != sched_id]
+            self.save()
 
     def batch_add_schedules(self, schedule_list):
         """批量添加多个调度计划，一次性持久化，避免 N 次磁盘 IO"""
-        if "schedules" not in self.data_store:
-            self.data_store["schedules"] = []
-        self.data_store["schedules"].extend(schedule_list)
-        self.save()
+        with self._lock:
+            if "schedules" not in self.data_store:
+                self.data_store["schedules"] = []
+            self.data_store["schedules"].extend(schedule_list)
+            self.save()
         
     def update_schedule(self, sched_id, updated_fields: dict):
-        schedules = self.data_store.get("schedules", [])
-        for s in schedules:
-            if s.get("id") == sched_id:
-                s.update(updated_fields)
-                break
-        self.save()
+        with self._lock:
+            schedules = self.data_store.get("schedules", [])
+            for s in schedules:
+                if s.get("id") == sched_id:
+                    s.update(updated_fields)
+                    break
+            self.save()

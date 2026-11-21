@@ -10,6 +10,22 @@ except ImportError:
 import asyncio
 from utils.logger import global_logger
 
+def _get_node_from_index(index):
+    """支持从直接 Model 或 QSortFilterProxyModel 代理模型中安全获取对应行的数据节点"""
+    model = index.model()
+    if not model:
+        return None
+    if hasattr(model, 'mapToSource') and hasattr(model, 'sourceModel'):
+        src_index = model.mapToSource(index)
+        src_model = model.sourceModel()
+        if src_model and hasattr(src_model, '_data_cache') and 0 <= src_index.row() < len(src_model._data_cache):
+            return src_model._data_cache[src_index.row()]
+        return None
+    if hasattr(model, '_data_cache') and 0 <= index.row() < len(model._data_cache):
+        return model._data_cache[index.row()]
+    return None
+
+
 class ActionButtonDelegate(QStyledItemDelegate):
     """
     自绘表格控制按钮委托器
@@ -23,19 +39,24 @@ class ActionButtonDelegate(QStyledItemDelegate):
         self.opc_engine = opc_engine
         self._hover_pos = QPoint(-1, -1)
         self._hover_index = None
+        # 写入任务强引用池：asyncio 只持弱引用，create_task() 的返回值不保存时
+        # 任务可能在中途被 GC 回收（协程永远不完成、WaitCursor 也永远不恢复）。
+        self._write_tasks = set()
+
+    def sizeHint(self, option, index):
+        """保证控制列行高足够，按钮点击区更大"""
+        hint = super().sizeHint(option, index)
+        if index.column() == 5:
+            hint.setHeight(max(hint.height(), 32))
+        return hint
 
     def paint(self, painter, option, index):
         if index.column() != 5: # 假设最后一列为控制列
             super().paint(painter, option, index)
             return
 
-        model = index.model()
-        if not model or not hasattr(model, '_data_cache'):
-            return
-            
-        try:
-            node = model._data_cache[index.row()]
-        except IndexError:
+        node = _get_node_from_index(index)
+        if not node:
             return
 
         dtype = str(node.get('type', '')).lower()
@@ -44,6 +65,11 @@ class ActionButtonDelegate(QStyledItemDelegate):
             painter.drawText(option.rect, Qt.AlignCenter, "-")
             return
         
+        # 列宽过窄时无法容纳双按钮，退化为占位符，避免按钮错位/越界
+        if option.rect.width() < 90:
+            painter.drawText(option.rect, Qt.AlignCenter, "-")
+            return
+
         # 为了复刻效果图，画两个按钮：【开启】 【关闭】
         btn1_rect = option.rect.adjusted(2, 2, -option.rect.width()//2 - 2, -2)
         btn2_rect = option.rect.adjusted(option.rect.width()//2 + 2, 2, -2, -2)
@@ -88,11 +114,8 @@ class ActionButtonDelegate(QStyledItemDelegate):
                     self.parent().viewport().update()
                     
             if event.type() == QEvent.MouseButtonRelease:
-                if not hasattr(model, '_data_cache'): return False
-                
-                try:
-                    node = model._data_cache[index.row()]
-                except IndexError:
+                node = _get_node_from_index(index)
+                if not node:
                     return False
                     
                 dtype = str(node.get('type', '')).lower()
@@ -100,7 +123,11 @@ class ActionButtonDelegate(QStyledItemDelegate):
                     return False # 非布尔不再阻拦处理
                     
                 node_id = node.get('node_id')
-                
+
+                # 列宽过窄时不响应按钮点击（与 paint 的退化逻辑保持一致）
+                if option.rect.width() < 90:
+                    return False
+
                 click_pos = event.pos()
                 btn1_rect = option.rect.adjusted(2, 2, -option.rect.width()//2 - 2, -2)
                 btn2_rect = option.rect.adjusted(option.rect.width()//2 + 2, 2, -2, -2)
@@ -125,13 +152,21 @@ class ActionButtonDelegate(QStyledItemDelegate):
 
         # 操作反馈：改变光标状态
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        # 发起写入异步任务
+        # 发起写入异步任务（保留强引用，防止任务被 GC 提前回收）
         task = asyncio.create_task(self.opc_engine.write_node_value(node_id, target_val))
+        self._write_tasks.add(task)
 
         # 挂载回调恢复光标，确保无论如何都恢复光标
         def on_done(t):
+            self._write_tasks.discard(t)
             try:
                 QApplication.restoreOverrideCursor()
             except Exception:
                 pass  # 防止 widget 已销毁时出错
+            try:
+                exc = t.exception()
+            except Exception:
+                exc = None
+            if exc is not None:
+                global_logger.error(f"Write task failed for {node_id}: {exc}")
         task.add_done_callback(on_done)

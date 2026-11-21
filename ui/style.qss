@@ -1,37 +1,57 @@
 /* =========================================================
-   鍏ㄥ眬鐜颁唬鍖栨牱寮忚〃 (Modern UI Stylesheet)
-   鐏垫劅鏉ユ簮: Antigravity Tools Dashboard 鍗＄墖寮忚璁?   鑹插僵瑙勮寖:
-   - 鍏ㄥ眬鑳屾櫙: #f4f7fb (鏋佹贰娴呰摑鍋忕伆)
-   - 鍗＄墖鑳屾櫙: #ffffff (绾櫧)
-   - 鏂囨湰鑹? #0f172a (涓绘爣棰橀粦), #475569 (姝ｆ枃娣辩伆), #64748b (杈呭姪娴呯伆)
-   - 杈规鑹? #e2e8f0 (涓昏竟妗?, #f1f5f9 (鍐呯綉鏍?淇グ)
-   - 涓昏壊璋?涓绘寜閽? #3b82f6 (鏄庝寒钃?
+   全局现代化样式表 (Modern UI Stylesheet)
+   色彩规范:
+   - 全局背景: #f4f7fb (浅蓝偏灰)
+   - 卡片背景: #ffffff (纯白)
+   - 文本色: #0f172a (主标题黑), #475569 (正文深灰), #64748b (辅助浅灰)
+   - 边框色: #e2e8f0 (主边框), #f1f5f9 (内网格修饰)
+   - 主色调: #3b82f6 (明亮蓝)
 ========================================================= */
 
-/* --- 1. 鍏ㄥ眬鑳屾櫙涓庡瓧浣?--- */
+/* --- 1. 全局背景与字体 --- */
 QMainWindow {
     background-color: #f4f7fb;
 }
 
 QWidget {
-    font-family: "Inter", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-family: "Microsoft YaHei", "Segoe UI", "Inter", sans-serif;
     color: #0f172a;
 }
 
-/* 瑕嗙洊鐗瑰畾鍗＄墖/闈㈡澘鐨勫熀纭€ QWidget 鑳屾櫙閫忔槑锛岄槻姝㈠叏灞€搴曡壊瑕嗙洊鍗＄墖閲岀殑鍏冪礌 */
+/* 顶部状态栏紧凑卡片 */
 QFrame#DashboardCard {
     background-color: #ffffff;
     border: 1px solid #e2e8f0;
-    border-radius: 12px;
+    border-radius: 8px;
 }
 
-/* --- 2. 鎸夐挳 (Buttons) --- */
+/* 分组框 (GroupBox) 紧凑无过多冗余留白 */
+QGroupBox {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 8px;
+    font-weight: 600;
+    font-size: 13px;
+    color: #334155;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 4px;
+    background-color: #f4f7fb;
+    color: #475569;
+}
+
+/* --- 2. 按钮 (Buttons) --- */
 QPushButton {
     background-color: #ffffff;
-    color: #3b82f6; /* 涓昏壊璋冨瓧鑹?*/
+    color: #3b82f6;
     border: 1px solid #bfdbfe;
     border-radius: 6px;
-    padding: 6px 16px;
+    padding: 4px 14px;
     font-size: 13px;
     font-weight: 600;
 }
@@ -48,33 +68,29 @@ QPushButton:disabled {
     border: 1px solid #e2e8f0;
 }
 
-/* 濡傛灉鏈変竴浜涚壒鍒寚瀹氱殑鎸夐挳濡傛洿鏂般€佸鍑猴紝鍙互鐢ㄧ壒瀹氱被鍚嶏紝杩欓噷閫氶厤鍩虹 */
-
-/* --- 3. 鏂囨湰杈撳叆妗嗕笌涓嬫媺妗?(LineEdits & ComboBoxes) --- */
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+/* --- 3. 文本输入框与下拉框 (LineEdits & ComboBoxes) --- */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit {
     background-color: #ffffff;
     border: 1px solid #cbd5e1;
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 4px 8px;
     color: #0f172a;
     selection-background-color: #bfdbfe;
     min-height: 20px;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus {
     border: 1px solid #3b82f6;
     background-color: #ffffff;
 }
-QLineEdit:hover, QComboBox:hover {
+QLineEdit:hover, QComboBox:hover, QTimeEdit:hover {
     border: 1px solid #94a3b8;
 }
 
-/* 涓嬫媺妗嗙壒瀹氱殑绠ご鎸夐挳鏀归€?*/
 QComboBox::drop-down {
     border: none;
-    width: 24px;
+    width: 20px;
 }
 QComboBox::down-arrow {
-    /* 濡傛灉鏈夊浘鐗囧彲浠ョ敤 image: url(...); 杩欓噷绠€鍗曠暀绌猴紝渚濋潬榛樿涔熻兘鍑戝悎锛屾垨鑰呯敾涓悜涓嬬殑灏忎笁瑙?(闇€鍥剧墖鎴栬嚜瀹氫箟) */
     width: 0px; 
 }
 QComboBox QAbstractItemView {
@@ -86,27 +102,32 @@ QComboBox QAbstractItemView {
     outline: none;
 }
 
-/* --- 4. 鏍囩椤?(TabWidget & TabBar) --- */
+/* --- 4. 标签页 (TabWidget & TabBar) 解决文字半截腰斩与空间挤压 --- */
 QTabWidget::pane {
     border: 0px; 
-    border-top: 1px solid #e2e8f0; /* 浠呬繚鐣欓《閮ㄥ垎闅?*/
+    border-top: 1px solid #e2e8f0;
     background-color: transparent; 
+}
+
+QTabBar {
+    qproperty-drawBase: 0;
+    background-color: transparent;
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px;
+    font-weight: bold;
 }
 
 QTabBar::tab {
     background-color: transparent;
     color: #64748b;
-    padding: 8px 24px; /* 调整 padding 避免挤压文字 */
-    min-height: 28px;  /* 增加基础高度以防止中文字体顶部被截断 */
-    font-size: 15px;
-    font-weight: 600;
-    border-bottom: 3px solid transparent; /* 留出底部边框空间 */
-    margin-right: 4px;
+    padding: 8px 18px 8px 18px;
+    border-bottom: 3px solid transparent;
+    margin-right: 6px;
 }
 
 QTabBar::tab:selected {
     color: #3b82f6;
-    border-bottom: 3px solid #3b82f6; /* 閫変腑鏃跺彉鎴愯摑鑹蹭笅鍒掔嚎 */
+    border-bottom: 3px solid #3b82f6;
 }
 
 QTabBar::tab:hover:!selected {
@@ -114,26 +135,26 @@ QTabBar::tab:hover:!selected {
     border-bottom: 3px solid #cbd5e1;
 }
 
-/* --- 5. 琛ㄦ牸涓庢爲褰㈣鍥?(TableView & TreeView) --- */
-QTableView, QTreeView, QListView {
+/* --- 5. 表格与树形视图 (TableView & TreeView) --- */
+QTableView, QTreeView, QListView, QTableWidget {
     background-color: #ffffff;
     border: 1px solid #e2e8f0;
-    border-radius: 8px;
-    gridline-color: #f1f5f9; /* 鍘绘帀寮虹儓鐨勯粦妗嗭紝浣跨敤娣¤壊鍒嗛殧绾?*/
+    border-radius: 6px;
+    gridline-color: #f1f5f9;
     selection-background-color: #eff6ff;
     selection-color: #0f172a;
-    alternate-background-color: #f8fafc; /* 浜ゆ浛琛岃儗鏅?*/
-    outline: none; /* 鍘婚櫎閫変腑鐨勮櫄绾挎 */
+    alternate-background-color: #f8fafc;
+    outline: none;
 }
 
 QHeaderView::section {
     background-color: #f8fafc;
     color: #475569;
-    padding: 6px 4px;
+    padding: 4px 4px;
     border: none;
     border-bottom: 1px solid #e2e8f0;
     font-weight: 600;
-    font-size: 13px;
+    font-size: 12px;
     text-align: left;
 }
 
@@ -153,13 +174,13 @@ QTableCornerButton::section {
 QScrollBar:vertical {
     border: none;
     background: #f8fafc;
-    width: 10px;
-    margin: 0px 0px 0px 0px;
+    width: 8px;
+    margin: 0px;
 }
 QScrollBar::handle:vertical {
     background: #cbd5e1;
     min-height: 20px;
-    border-radius: 5px;
+    border-radius: 4px;
 }
 QScrollBar::handle:vertical:hover {
     background: #94a3b8;
@@ -175,13 +196,13 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
 QScrollBar:horizontal {
     border: none;
     background: #f8fafc;
-    height: 10px;
-    margin: 0px 0px 0px 0px;
+    height: 8px;
+    margin: 0px;
 }
 QScrollBar::handle:horizontal {
     background: #cbd5e1;
     min-width: 20px;
-    border-radius: 5px;
+    border-radius: 4px;
 }
 QScrollBar::handle:horizontal:hover {
     background: #94a3b8;
@@ -194,27 +215,27 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
 }
 
-/* --- 7. 缇庡寲鐗瑰畾鐨勫崱鐗囨爣绛?(鐗瑰畾浜庝华琛ㄧ洏鐨勬暟鎹睍绀? --- */
+/* --- 7. 紧凑型仪表盘统计卡片文本 --- */
 QLabel#DashValueLabel {
     color: #0f172a;
-    font-size: 28px;
+    font-size: 20px;
     font-weight: bold;
 }
 QLabel#DashTitleLabel {
     color: #64748b;
-    font-size: 14px;
+    font-size: 12px;
+    font-weight: 500;
 }
 QLabel#DashIconLabel {
-    padding: 8px;
+    padding: 4px;
     border-radius: 6px;
     background-color: #f1f5f9;
 }
 
-/* 搴曢儴鏃堕挓鏍?*/
+/* 底部时钟条 */
 QLabel#BottomClock {
     background-color: transparent;
     color: #64748b;
-    font-size: 12px;
+    font-size: 11px;
+    padding: 2px 0px;
 }
-
-/* =========================================================
