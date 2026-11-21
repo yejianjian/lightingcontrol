@@ -17,7 +17,6 @@ except ImportError:
 
 import asyncio
 from datetime import datetime
-from opc.client_engine import OpcClientEngine
 from core.data_manager import DataManager
 from utils.logger import global_logger
 from utils.persistence import PersistenceManager
@@ -31,7 +30,10 @@ from core.group_scheduler import GroupScheduler
 class MainWindow(QMainWindow):
     # 协议/引擎插槽：默认 OPC UA；OPC DA 版本通过子类替换这两个类属性，
     # 其余页面（监控、分组、日志、调度）只依赖引擎的公共接口，完全复用。
-    ENGINE_CLASS = OpcClientEngine
+    # 默认引擎惰性解析：UA 版在 __init__ 中按需导入 opc.client_engine，DA 版子类直接
+    # 替换为 OpcDaClientEngine。这样 DA 打包时不会因为基类的顶层 import 把整条
+    # asyncua/cryptography 依赖链拖进 exe（见 LightingControlDA.spec 的 excludes）。
+    ENGINE_CLASS = None
     SETTINGS_CLASS = TabSettings
 
     # 最小窗口尺寸：必须低于 1024x768 屏幕的可用高度（减去任务栏约 40px），
@@ -86,7 +88,13 @@ class MainWindow(QMainWindow):
         # 核心数据与引擎
         self.pm = PersistenceManager()
         self.dm = DataManager(self.pm)
-        self.opc_engine = self.ENGINE_CLASS()  # 参数由设置页注入
+        # 引擎惰性解析：DA 版子类已把 ENGINE_CLASS 换成 OpcDaClientEngine，不会导入 UA；
+        # UA 版这里才真正 import opc.client_engine，避免 DA 打包被基类顶层 import 拖累。
+        engine_cls = self.ENGINE_CLASS
+        if engine_cls is None:
+            from opc.client_engine import OpcClientEngine
+            engine_cls = OpcClientEngine
+        self.opc_engine = engine_cls()  # 参数由设置页注入
 
         # 检查配置文件是否损坏
         if self.pm.was_load_corrupted():
@@ -388,6 +396,18 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
         # 判断是对可视区域做增量渲染，还是由于结构改变做了整体重新构建
         if self.dm.structure_changed:
             self.tab_monitor.on_refresh_clicked()
+            # 结构变化（设置页手动增删点位 / 重连后重建节点表）时，分组页已选分组的
+            # 成员快照同样过期，必须一起重取，否则用户会基于旧列表增删成员。
+            current_group = None
+            try:
+                current_group = self.tab_group.tree_groups.currentItem()
+            except Exception as e:
+                global_logger.debug(f"read tab_group current item failed (non-fatal): {e}")
+            if current_group is not None:
+                try:
+                    self.tab_group.refresh_members()
+                except Exception as e:
+                    global_logger.debug(f"tab_group.refresh_members() failed (non-fatal): {e}")
             self.dm.structure_changed = False
         elif dirty_nodes:
             # 委托子界面进行精确的行变动画重绘
@@ -474,6 +494,16 @@ QComboBox QAbstractItemView { background-color: #2d2d2d; color: #e0e0e0; border:
             # 停止所有定时器
             self.refresh_timer.stop()
             self.clock_timer.stop()
+            # 停止设置页后台任务：服务器枚举线程解绑、手动点位任务取消。
+            # QTabWidget 子页面收不到主窗口 closeEvent，必须由顶层显式触发，
+            # 否则退出瞬间的回调可能访问已销毁的控件。
+            shutdown_bg = getattr(getattr(self, "tab_settings", None),
+                                  "shutdown_background_tasks", None)
+            if callable(shutdown_bg):
+                try:
+                    shutdown_bg()
+                except Exception as e:
+                    global_logger.debug("shutdown_background_tasks() failed (non-fatal): {}".format(e))
             # 停止调度器
             if hasattr(self, 'scheduler'):
                 self.scheduler.stop()

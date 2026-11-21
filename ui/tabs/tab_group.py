@@ -14,7 +14,7 @@ import asyncio
 import re
 import pandas as pd
 from utils.logger import global_logger
-from utils.filter_helper import filter_nodes
+from utils.filter_helper import filter_nodes, type_matches
 
 def _get_live_group(pm, group_id):
     """[新增] 取出持久化存储中的「活」分组对象。
@@ -224,12 +224,14 @@ class SearchProxyModel(QSortFilterProxyModel):
             node_val = str(model.data(node_idx) or "").lower()
             match_kw = (self.keyword in name_val) or (self.keyword in node_val)
             
-        # Type matches (col 3)
+        # Type matches (col 3)：按 TYPE_MAP 的类型语义匹配，而不是拿下拉框文本做
+        # 子串匹配。直接子串匹配时 DA 的类型名 Float/Double/Int16/UInt16 会出现
+        # "选 Real 筛不到、选 Int 误匹配 UInt16" 的问题。
         match_type = True
         if self.type_filter != "全部类型":
             type_idx = model.index(source_row, 3, source_parent)
             type_val = str(model.data(type_idx) or "")
-            match_type = (self.type_filter in type_val)
+            match_type = type_matches(type_val, self.type_filter)
             
         return match_kw and match_type
 

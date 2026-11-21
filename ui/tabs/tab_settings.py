@@ -47,6 +47,9 @@ class TabSettings(QWidget):
         # Task 强引用池：防止进行中的协程被 GC 回收
         self._connect_task = None
         self._disconnect_task = None
+        # 用户是否通过 QProgressDialog 的「取消」按钮终止了本次连接：
+        # 取消后连接流程的 finally 不得再把「已连接」投影到界面。
+        self._connect_cancelled = False
 
         self._setup_ui()
         self._apply_state(self.engine.state, {"reason": "initial"})
@@ -478,6 +481,26 @@ class TabSettings(QWidget):
         }
         self.dm.pm.save()
 
+    def _on_connect_progress_canceled(self):
+        """QProgressDialog 的「取消」按钮：真正取消本次连接尝试。
+
+        只 close() 对话框不会打断正在 await 的 connect()/bootstrap()，后台仍会
+        连上并挂载点位。这里先取消连接任务，再用一个独立任务
+        （stop_reconnect + disconnect）收尾 —— 收尾是异步的，不阻塞 UI 线程。
+        """
+        if self._connect_cancelled:
+            # 同一轮连接只收尾一次（连点/关闭对话框可能重复触发 canceled）。
+            return
+        self._connect_cancelled = True
+        global_logger.info("用户取消连接：正在取消本次连接尝试并释放已建立的会话...")
+        task = self._connect_task
+        if task is not None and not task.done():
+            task.cancel()
+        # 取消意图同时同步到自动重连复选框：收尾的 disconnect 会关闭重连总闸，
+        # 若不复选位就会再次出现"界面勾着自动重连、引擎其实已关闭"的错位。
+        self._set_auto_reconnect_preference(False)
+        self._disconnect_task = asyncio.create_task(self._disconnect(clear_nodes=False))
+
     async def _connect_and_load(self):
         # 自包含：无论从哪个入口进来（点击连接 / 启动自动连接 / 后续调用），
         # 都先把界面上的连接参数注入引擎。否则在 on_connect_clicked 之外的路径上，
@@ -491,12 +514,20 @@ class TabSettings(QWidget):
         progress.setWindowTitle("连接中")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        # 「取消」必须绑定槽：QProgressDialog 默认只把对话框关掉，不会打断
+        # 正在 await 的 connect()/bootstrap()，用户会以为取消无效。
+        progress.canceled.connect(self._on_connect_progress_canceled)
         progress.setValue(10)
         progress.setLabelText(f"正在连接 {self.engine.url}...")
 
+        self._connect_cancelled = False
         try:
             global_logger.info(f"Connecting to {self.engine.url}...")
             await self.engine.connect()
+            if self._connect_cancelled:
+                # 底层 client.connect() 是同步阻塞调用，CancelledError 往往要等它
+                # 返回后才送达；这里再确认一次取消意图，绝不继续装配点位/订阅。
+                raise asyncio.CancelledError()
             progress.setValue(40)
             progress.setLabelText("已连接，正在加载节点...")
             global_logger.info("Connected. Loading node tree...")
@@ -517,11 +548,29 @@ class TabSettings(QWidget):
         except asyncio.CancelledError:
             global_logger.info("Initial connection flow cancelled.")
         except Exception as e:
-            global_logger.error(f"Connection flow failed: {e}", exc_info=True)
-            QMessageBox.critical(self, "连接流失败", str(e))
+            if self._connect_cancelled:
+                # 用户已取消：收尾 disconnect 会让引擎抛出 ConnectionSuperseded 之类
+                # 的异常，这属于正常终止，不能再弹「连接流失败」吓值守人员。
+                global_logger.info(f"Connection flow ended after user cancel: {e}")
+            else:
+                global_logger.error(f"Connection flow failed: {e}", exc_info=True)
+                QMessageBox.critical(self, "连接流失败", str(e))
         finally:
+            # 关键：QProgressDialog.close() 在 Qt 内部也会发出 canceled 信号
+            # （closeEvent 中 emit），若不解绑，每次正常连接结束都会被当成
+            # "用户取消"而立刻断开。只允许真正的用户点击/关闭对话框触发取消。
+            try:
+                progress.canceled.disconnect(self._on_connect_progress_canceled)
+            except (TypeError, RuntimeError):
+                pass
             progress.close()
-            self._apply_state(self.engine.state, {"reason": "manual connect finished"})
+            if self._connect_cancelled:
+                # 用户已点「取消」：连接任务可能直到 engine 已经连上之后才收到
+                # CancelledError，此处绝不能把 engine.state 的「已连接」投影到界面；
+                # 收尾任务 _disconnect() 会在真正断开后自行刷新为「未连接」。
+                global_logger.info("用户取消连接：连接流程已终止，界面保持未连接状态。")
+            else:
+                self._apply_state(self.engine.state, {"reason": "manual connect finished"})
 
     async def _disconnect(self, clear_nodes=True):
         try:
@@ -545,9 +594,14 @@ class TabSettings(QWidget):
     # 引擎回调
     # ----------------------------------------------------------------------------------
 
-    def _on_sub_data(self, node_id, value, timestamp):
-        # 接收到底层推送，交给 DataManager 中心处理合并
-        self.dm.update_node(node_id, {"value": value, "timestamp": timestamp})
+    def _on_sub_data(self, node_id, value, timestamp, quality=None):
+        # 接收到底层推送，交给 DataManager 中心处理合并。
+        # quality 必须同步进 DataManager：监控表用它实时显示/恢复「通信异常」，
+        # 只在连接/重连时发布点位表会让坏质量状态卡住或永远不出现。
+        payload = {"value": value, "timestamp": timestamp}
+        if quality is not None:
+            payload["quality"] = quality
+        self.dm.update_node(node_id, payload)
 
     def _publish_nodes_to_bus(self):
         """把引擎缓存的点位表发布到 DataManager（UI 的唯一数据来源）。
@@ -557,10 +611,7 @@ class TabSettings(QWidget):
         """
         nodes = list(getattr(self.engine, "nodes", {}).values())
         if not nodes:
-            global_logger.warning(
-                "Node tree is empty after bootstrap - check the namespace filter "
-                "(节点命名空间前缀) and whether the server actually exposes variables."
-            )
+            self._log_empty_node_tree()
             return 0
 
         for cached in nodes:
@@ -571,6 +622,17 @@ class TabSettings(QWidget):
         self.dm.structure_changed = True
         global_logger.info(f"Published {len(nodes)} nodes to the data bus.")
         return len(nodes)
+
+    def _log_empty_node_tree(self):
+        """点位表为空时的提示（协议中立，子类可按协议调整语气）。
+
+        原文案写死"检查 ns 命名空间前缀（UA 专用）"，DA 版删掉最后一个手动点位后
+        空表完全正常，用 UA 的排查建议告警会误导现场。
+        """
+        global_logger.warning(
+            "当前点位表为空（node tree is empty）：自动扫描为空且未配置手动点位，"
+            "或点位刚被移除；请检查服务器地址空间/手动点位配置。"
+        )
 
     def _handle_connection_lost(self):
         """引擎上报断线（每个连接生命周期只触发一次）。
@@ -693,7 +755,7 @@ class TabSettings(QWidget):
             self.btn_connect.setEnabled(True)
             self.btn_connect.setText("取消连接")
             self.btn_connect.setStyleSheet("color: #f59e0b;")
-            self.lbl_conn_status.setText("正在建立安全通道...")
+            self.lbl_conn_status.setText("正在建立通信连接...")
             self.lbl_conn_status.setStyleSheet("color: #f59e0b;")
             if dash:
                 dash.value_label.setText("正在连接...")
@@ -715,7 +777,7 @@ class TabSettings(QWidget):
         elif state == 'disconnecting':
             self.btn_connect.setEnabled(False)
             self.btn_connect.setText("正在断开中...")
-            self.lbl_conn_status.setText("正在释放会话与安全通道...")
+            self.lbl_conn_status.setText("正在释放会话与连接资源...")
             self.lbl_conn_status.setStyleSheet("color: #f59e0b;")
 
         else:  # disconnected

@@ -23,7 +23,7 @@ class DaMainWindow(MainWindow):
     ENGINE_CLASS = OpcDaClientEngine
     SETTINGS_CLASS = DaTabSettings
 
-    TITLE = "灯光自动控制系统 DA 版 V1.2.1"
+    TITLE = "灯光自动控制系统 DA 版 V1.2.4"
 
     def __init__(self):
         super().__init__()

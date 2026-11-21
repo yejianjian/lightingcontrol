@@ -1,7 +1,7 @@
 """OPC DA 版程序入口（与 main.py 同构，只是换成 DaMainWindow）。
 
 运行：python main_da.py
-打包：build_da.bat -> dist/LightingControlDA_v1.2.1.exe
+打包：build_da.bat -> dist/LightingControlDA_v1.2.4.exe
 """
 
 import sys

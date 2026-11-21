@@ -26,6 +26,32 @@ def _get_node_from_index(index):
     return None
 
 
+def _is_node_writable(node):
+    """判断点位是否允许 UI 写值（决定是否绘制/响应开关按钮）。
+
+    OPC DA 引擎会在节点字典里给出 'writable'（bool）；OPC UA 版没有该字段，
+    缺失时必须按可写处理以保持兼容。另外兼容 'access'：整型按 UA AccessLevel
+    的写位（0x02）判断，字符串形式（'ReadOnly'/'只读'）视为只读。
+    """
+    if not node:
+        return False
+    writable = node.get('writable')
+    if writable is not None:
+        return bool(writable)
+    access = node.get('access')
+    if access is not None:
+        if isinstance(access, str):
+            text = access.strip().lower()
+            if 'readonly' in text or 'read-only' in text or '只读' in text:
+                return False
+            return True
+        try:
+            return bool(int(access) & 0x02)
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
 class ActionButtonDelegate(QStyledItemDelegate):
     """
     自绘表格控制按钮委托器
@@ -63,6 +89,13 @@ class ActionButtonDelegate(QStyledItemDelegate):
         if 'bool' not in dtype and 'boolean' not in dtype:
             # 对于非布尔类型，不再绘制按键，只画一个减号表示不可开关
             painter.drawText(option.rect, Qt.AlignCenter, "-")
+            return
+
+        # 点位级只读：DA 引擎的节点字典带 writable=False（UA 版无该字段，按可写处理）。
+        # 只读点位若仍画开关按钮，用户误点会走引擎写入并被判为写失败，多次点击会
+        # 触发整链重连，因此这里只绘制「只读」且不响应点击。
+        if not _is_node_writable(node):
+            painter.drawText(option.rect, Qt.AlignCenter, "只读")
             return
         
         # 列宽过窄时无法容纳双按钮，退化为占位符，避免按钮错位/越界
@@ -117,6 +150,10 @@ class ActionButtonDelegate(QStyledItemDelegate):
                 node = _get_node_from_index(index)
                 if not node:
                     return False
+
+                # 只读点位不响应点击（与 paint 的「只读」退化保持一致）
+                if not _is_node_writable(node):
+                    return False
                     
                 dtype = str(node.get('type', '')).lower()
                 if 'bool' not in dtype and 'boolean' not in dtype:
@@ -147,7 +184,7 @@ class ActionButtonDelegate(QStyledItemDelegate):
         global_logger.info(f"==== UI单点操作触发 ==== -> [点位: {alias}] | 指令发送: 【{action_name}】")
 
         if not self.opc_engine.connected:
-            QMessageBox.warning(self.parent(), "错误", "目前未连接到 OPC UA 服务器。")
+            QMessageBox.warning(self.parent(), "错误", "目前未连接到 OPC 服务器。")
             return
 
         # 操作反馈：改变光标状态

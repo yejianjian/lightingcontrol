@@ -31,6 +31,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from opcda.engine import OpcDaClientEngine  # noqa: E402
+from opcda import com  # noqa: E402
 from utils.logger import global_logger  # noqa: E402
 
 
@@ -40,15 +41,16 @@ from utils.logger import global_logger  # noqa: E402
 
 GOOD_QUALITY = 0xC0
 BAD_QUALITY = 0x00
-E_ACCESSDENIED = -2147467259  # 0x80004005 的常见替代：写只读点位
+E_ACCESSDENIED = com.E_ACCESSDENIED  # 0x80070005：写只读点位时的点位级拒绝
 
 
 class FakeOpcDaError(Exception):
-    """模拟 opcda.client.OpcDaError（带 HRESULT code）。"""
+    """模拟 opcda.client.OpcDaError（带 HRESULT code / 逐项错误列表）。"""
 
-    def __init__(self, message, code=None):
+    def __init__(self, message, code=None, errors=None):
         super().__init__(message)
         self.code = code
+        self.errors = errors
 
 
 class FakeDaItem:
@@ -117,6 +119,15 @@ class FakeDaClient:
         self.fail_write = None
         self.fail_add_items = None
         self.fail_subscription = None
+        # 可选 HRESULT 码/逐项错误（用于区分点位级业务错误与链路故障）
+        self.fail_read_code = None
+        self.fail_write_code = None
+        self.fail_add_items_code = None
+        self.fail_subscription_code = None
+        self.add_items_error = None
+        self.server_state = 1
+        self.server_state_text = "RUNNING"
+        self.update_rate_calls = []
 
     # --- 连接 ---------------------------------------------------------------
     def connect(self, timeout=15.0):
@@ -136,8 +147,8 @@ class FakeDaClient:
         if self.fail_status:
             raise FakeOpcDaError(self.fail_status)
         return {
-            "state": 1,
-            "state_text": "RUNNING",
+            "state": self.server_state,
+            "state_text": self.server_state_text,
             "vendor": "Fake OPC DA",
             "version": "1.0.0",
             "group_count": 1,
@@ -158,8 +169,10 @@ class FakeDaClient:
     def add_items(self, item_ids, update_rate_ms=500):
         item_ids = list(item_ids)
         self.add_items_calls.append((item_ids, update_rate_ms))
+        if self.add_items_error is not None:
+            raise self.add_items_error
         if self.fail_add_items:
-            raise FakeOpcDaError(self.fail_add_items)
+            raise FakeOpcDaError(self.fail_add_items, code=self.fail_add_items_code)
         results = []
         for item_id in item_ids:
             handle = self.handles.get(item_id)
@@ -193,7 +206,7 @@ class FakeDaClient:
     def read_items(self, item_ids=None, source=1):
         self.read_calls.append((None if item_ids is None else list(item_ids), source))
         if self.fail_read:
-            raise FakeOpcDaError(self.fail_read)
+            raise FakeOpcDaError(self.fail_read, code=self.fail_read_code)
         ids = list(item_ids) if item_ids is not None else list(self.values.keys())
         return [
             FakeDaValue(value=self.values.get(item_id), quality=GOOD_QUALITY,
@@ -205,7 +218,7 @@ class FakeDaClient:
     def write_items(self, values):
         self.write_calls.append(dict(values))
         if self.fail_write:
-            raise FakeOpcDaError(self.fail_write)
+            raise FakeOpcDaError(self.fail_write, code=self.fail_write_code)
         results = []
         for item_id, _value in values.items():
             if self.writable.get(item_id, True):
@@ -220,13 +233,19 @@ class FakeDaClient:
 
     def start_subscription(self, update_rate_ms=500):
         if self.fail_subscription:
-            raise FakeOpcDaError(self.fail_subscription)
+            raise FakeOpcDaError(self.fail_subscription, code=self.fail_subscription_code)
         self.subscribed = True
         self.subscription_rate = update_rate_ms
 
     def stop_subscription(self):
         self.subscribed = False
         self.subscription_stopped = True
+
+    def set_update_rate_ms(self, rate):
+        """模拟客户端原地修改组更新周期（不重建组/不中断订阅）。"""
+        self.update_rate_calls.append(rate)
+        self.subscription_rate = rate
+        return rate
 
     def get_error_string(self, code):
         return "fake error 0x{:08X}".format(int(code) & 0xFFFFFFFF)
@@ -364,13 +383,23 @@ class TestConnectAndBootstrap(EngineTestBase):
             self.assertIn("type", node)
             self.assertNotIn("node_obj", node)
 
-    async def test_initial_value_refresh_tolerates_read_failure(self):
+    async def test_initial_value_refresh_tolerates_item_level_read_failure(self):
         await self.engine.connect()
-        self.factory.last().fail_read = "RPC server unavailable"
-        # 读初值失败不致命（契约：bootstrap 失败/超时必须回到重连流程，但读失败
-        # 由心跳继续探测；至少不能抛异常卡死）
+        # 点位级读取失败（如只写点位不可读）只告警，不影响其余点位装配
+        self.factory.last().fail_read = "item is write-only"
+        self.factory.last().fail_read_code = com.OPC_E_WRITEONLY
         await self.engine.bootstrap()
         self.assertEqual(self.engine.state, OpcDaClientEngine.STATE_CONNECTED)
+
+    async def test_initial_value_refresh_aborts_on_link_failure(self):
+        # 链路级读取失败（RPC/未连接）必须上抛，绝不能在已断开的 COM 对象上
+        # 继续建立订阅并假装 connected（假连接）。
+        await self.engine.connect()
+        self.factory.last().fail_read = "RPC server unavailable"
+        self.factory.last().fail_read_code = com.RPC_S_CALL_FAILED
+        with self.assertRaises(Exception):
+            await self.engine.bootstrap()
+        self.assertNotEqual(self.engine.state, OpcDaClientEngine.STATE_CONNECTED)
 
 
 class TestSubscriptionDispatch(EngineTestBase):
@@ -706,11 +735,12 @@ class TestWrites(EngineTestBase):
         self.assertTrue(ok)
         self.assertEqual(self.client.write_calls[-1], {"Random.Boolean": True})
 
-        # 模拟服务器拒绝：假客户端对该点位返回 E_ACCESSDENIED
+        # 模拟服务器拒绝（只读/权限不足）：属点位级拒绝，不累计连续写失败、不断链
         self.client.writable["Random.Boolean"] = False
         ok = await self.engine.write_node_value("Random.Boolean", True)
         self.assertFalse(ok)
-        self.assertEqual(self.engine._consecutive_write_failures, 1)
+        self.assertEqual(self.engine._consecutive_write_failures, 0)
+        self.assertEqual(self.engine.state, OpcDaClientEngine.STATE_CONNECTED)
 
     async def test_batch_write_counts(self):
         success, fail = await self.engine.write_values_batch(
@@ -806,7 +836,8 @@ class TestDisconnectAndConfigure(EngineTestBase):
 class TestWriteFailureTriggersReconnect(EngineTestBase):
     """连续写失败达到阈值 -> 受控重连（而不是静默失败）。"""
 
-    async def test_consecutive_write_failures_trigger_lost(self):
+    async def test_item_level_write_rejections_do_not_trigger_reconnect(self):
+        """只读/类型不匹配等点位级拒绝不能累计成链路失败（误点 3 次不再断链）。"""
         self.engine, self.factory = self.make_engine()
         await self.engine.connect()
         await self.engine.bootstrap()
@@ -815,10 +846,283 @@ class TestWriteFailureTriggersReconnect(EngineTestBase):
         self.engine._max_write_failures = 2
         self.factory.last().writable["Write Only.Boolean"] = False
 
-        await self.engine.write_node_value("Write Only.Boolean", True)
+        for _ in range(4):
+            ok = await self.engine.write_node_value("Write Only.Boolean", True)
+            self.assertFalse(ok)
+        self.assertEqual(self.engine._consecutive_write_failures, 0)
+        self.assertEqual(self.engine.state, OpcDaClientEngine.STATE_CONNECTED)
+
+    async def test_consecutive_link_write_failures_trigger_lost(self):
+        """传输层写异常（RPC 断链）仍必须按连续失败触发受控重连。"""
+        self.engine, self.factory = self.make_engine()
+        await self.engine.connect()
+        await self.engine.bootstrap()
+        self.engine.heartbeat_interval_s = 5.0
+        self.engine._auto_reconnect = True
+        self.engine._max_write_failures = 2
+        client = self.factory.last()
+        client.fail_write = "RPC server unavailable"
+        client.fail_write_code = com.RPC_S_CALL_FAILED
+
+        await self.engine.write_node_value("Random.Boolean", True)
         self.assertEqual(self.engine._consecutive_write_failures, 1)
-        await self.engine.write_node_value("Write Only.Boolean", True)
+        await self.engine.write_node_value("Random.Boolean", True)
         self.assertNotEqual(self.engine.state, OpcDaClientEngine.STATE_CONNECTED)
+
+
+class TestErrorClassificationAndReliability(EngineTestBase):
+    """审查报告回归：链路故障与点位级错误的严格区分、假连接、死链重连。"""
+
+    async def test_additems_item_level_errors_are_partial_not_link_failure(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        await engine.connect()
+        client = factory.last()
+        # 错误文本故意包含『点位』：旧实现会按关键字误判，这里要求全部点位级才容忍
+        client.add_items_error = FakeOpcDaError(
+            "所有点位添加失败（共 4 个）", code=com.OPC_E_UNKNOWNITEMID,
+            errors=[(item_id, com.OPC_E_UNKNOWNITEMID, "unknown item")
+                    for item_id, _n, _p, _vt, _access in DEFAULT_ITEMS])
+        client.fail_subscription = "async unsupported"
+        await engine.bootstrap()  # 不应抛异常
+        self.assertEqual(engine.state, OpcDaClientEngine.STATE_CONNECTED)
+
+    async def test_additems_link_failure_text_with_item_word_is_not_swallowed(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        await engine.connect()
+        client = factory.last()
+        client.fail_add_items = "批量添加点位失败（4 个）"
+        client.fail_add_items_code = com.RPC_S_CALL_FAILED
+        with self.assertRaises(Exception):
+            await engine.bootstrap()
+        self.assertNotEqual(engine.state, OpcDaClientEngine.STATE_CONNECTED)
+
+    async def test_subscription_link_error_is_not_downgraded_to_poll(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine.set_subscription_callback(lambda *args: None)
+        await engine.connect()
+        client = factory.last()
+        client.fail_subscription = "COM error during subscribe"
+        client.fail_subscription_code = com.RPC_E_DISCONNECTED
+        with self.assertRaises(Exception):
+            await engine.bootstrap()
+        self.assertNotEqual(engine._subscription_mode, "poll")
+
+    async def test_subscription_unsupported_code_downgrades_to_poll(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine.set_subscription_callback(lambda *args: None)
+        await engine.connect()
+        client = factory.last()
+        client.fail_subscription = "async unsupported"
+        client.fail_subscription_code = com.E_NOINTERFACE
+        await engine.bootstrap()
+        self.assertEqual(engine._subscription_mode, "poll")
+        self.assertEqual(engine.state, OpcDaClientEngine.STATE_CONNECTED)
+
+    async def test_reconnect_supervisor_not_duplicated_and_backoff_not_reset(self):
+        """回归：重连循环中 bootstrap 持续失败时不能出现两个 supervisor、不能重置退避。"""
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine._auto_reconnect = True
+        engine.reconnect_base_delay = 0.05
+        engine.reconnect_max_delay = 0.05
+        base_factory = engine._client_factory
+
+        def failing_factory(prog_id, host):
+            client = base_factory(prog_id, host)
+            client.fail_browse = "browse always fails"
+            return client
+
+        engine._client_factory = failing_factory
+        stats = {"active": 0, "max_active": 0, "starts": 0}
+        original_supervisor = engine._reconnect_supervisor
+
+        async def counting_supervisor():
+            stats["active"] += 1
+            stats["starts"] += 1
+            stats["max_active"] = max(stats["max_active"], stats["active"])
+            try:
+                return await original_supervisor()
+            finally:
+                stats["active"] -= 1
+
+        engine._reconnect_supervisor = counting_supervisor
+        attempts = []
+        engine.on_state_change = lambda state, detail: (
+            attempts.append(detail.get("attempt"))
+            if state == OpcDaClientEngine.STATE_RECONNECTING and detail.get("attempt")
+            else None)
+        await engine.reconnect_forever()
+        try:
+            ok = await wait_until(
+                lambda: engine.reconnect_attempt >= 3, timeout=8.0)
+            self.assertTrue(ok, "supervisor 未持续重试（attempt=%r)" % engine.reconnect_attempt)
+            await asyncio.sleep(0.15)
+            self.assertEqual(stats["max_active"], 1,
+                             "bootstrap 失败期间出现并发 supervisor: %r" % stats)
+            self.assertGreaterEqual(max(attempts or [0]), 3,
+                                    "指数退避被重置，attempt 序列: %r" % attempts)
+            self.assertEqual(attempts, sorted(attempts),
+                             "supervisor 尝试序号倒退，退避被重置: %r" % attempts)
+            self.assertEqual(len(attempts), len(set(attempts)),
+                             "出现重复的 Attempt 1（双 supervisor 竞争）: %r" % attempts)
+        finally:
+            engine.stop_reconnect()
+            await asyncio.sleep(0.1)
+
+    async def test_kwargs_callback_receives_quality_by_keyword(self):
+        """3 位置参数 + **kwargs 的回调不能被误用位置参数调用（会 TypeError）。"""
+        engine, factory = self.make_engine()
+        self.engine = engine
+        captured = []
+
+        def callback(node_id, value, timestamp, **kwargs):
+            captured.append((node_id, value, kwargs.get("quality")))
+
+        engine.set_subscription_callback(callback)
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        handle = client.handles["Random.Int1"]
+        client.push_values([FakeDaValue(value=7, quality=BAD_QUALITY,
+                                        client_handle=handle, timestamp="t")])
+        self.assertEqual(captured[-1][2], BAD_QUALITY)
+
+    async def test_subscription_callback_receives_quality_when_supported(self):
+        """4 参回调必须拿到实时质量码（监控页通信异常状态依赖它）。"""
+        engine, factory = self.make_engine()
+        self.engine = engine
+        received = []
+        engine.set_subscription_callback(
+            lambda node_id, value, timestamp, quality: received.append(
+                (node_id, value, quality))
+        )
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        handle = client.handles["Random.Int1"]
+        client.push_values([FakeDaValue(value=5, quality=BAD_QUALITY,
+                                        client_handle=handle, timestamp="t1")])
+        client.push_values([FakeDaValue(value=6, quality=GOOD_QUALITY,
+                                        client_handle=handle, timestamp="t2")])
+        self.assertEqual([entry[2] for entry in received], [BAD_QUALITY, GOOD_QUALITY])
+        self.assertEqual(engine.nodes["Random.Int1"]["quality"], GOOD_QUALITY)
+
+    async def test_three_argument_callback_remains_supported(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        received = []
+        engine.set_subscription_callback(
+            lambda node_id, value, timestamp: received.append((node_id, value)))
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        handle = client.handles["Random.Int1"]
+        client.push_values([FakeDaValue(value=9, quality=GOOD_QUALITY,
+                                        client_handle=handle, timestamp="t")])
+        self.assertTrue(received)
+
+    async def test_bootstrap_failure_returns_to_disconnected_when_auto_reconnect_off(self):
+        """connect 成功但 bootstrap 失败时不能永久停在 loading。"""
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine._auto_reconnect = False
+        await engine.connect()
+        factory.last().fail_browse = "server busy during browse"
+        with self.assertRaises(Exception):
+            await engine.bootstrap()
+        self.assertEqual(engine.state, OpcDaClientEngine.STATE_DISCONNECTED)
+        self.assertIsNone(engine.client, "失败后应释放已建立的 COM 会话")
+
+    async def test_bootstrap_failure_enters_reconnecting_when_auto_reconnect_on(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine._auto_reconnect = True
+        engine.reconnect_base_delay = 5.0
+        engine.reconnect_max_delay = 5.0
+        await engine.connect()
+        factory.last().fail_browse = "server busy during browse"
+        with self.assertRaises(Exception):
+            await engine.bootstrap()
+        self.assertEqual(engine.state, OpcDaClientEngine.STATE_RECONNECTING)
+        engine.stop_reconnect()
+
+    async def test_connect_success_does_not_spawn_extra_supervisor(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine._auto_reconnect = True
+        await engine.connect()  # 只 connect（状态 LOADING，未 bootstrap）
+        self.assertIsNone(engine._reconnect_task)
+
+    async def test_manual_add_after_empty_bootstrap_starts_subscription(self):
+        self.items = []
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine.set_subscription_callback(lambda *args: None)
+        await engine.connect()
+        await engine.bootstrap()  # 0 点位 -> bootstrap 跳过订阅
+        self.assertIsNone(engine._subscription_mode)
+        await engine.add_manual_node("Manual.Point1", "手动点")
+        self.assertEqual(engine._subscription_mode, "async")
+        self.assertTrue(factory.last().subscribed)
+
+    async def test_s_false_value_is_accepted_not_dropped(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine.set_subscription_callback(lambda *args: None)
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        handle = client.handles["Random.Int1"]
+        client.push_values([FakeDaValue(value=42, quality=GOOD_QUALITY,
+                                        error=com.S_FALSE, client_handle=handle,
+                                        timestamp="2026-01-01 00:00:03")])
+        self.assertEqual(engine.nodes["Random.Int1"]["value"], 42)
+
+    async def test_heartbeat_comm_fault_triggers_connection_lost(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine.set_subscription_callback(lambda *args: None)
+        engine.heartbeat_interval_s = 0.05
+        engine._auto_reconnect = True
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        client.server_state = com.OPC_STATUS_COMM_FAULT
+        client.server_state_text = "COMM_FAULT"
+        ok = await wait_until(
+            lambda: engine.state != OpcDaClientEngine.STATE_CONNECTED, timeout=5.0)
+        self.assertTrue(ok, "COMM_FAULT 心跳状态未触发受控重连")
+
+    async def test_heartbeat_abnormal_state_warns_without_dropping_link(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        engine.set_subscription_callback(lambda *args: None)
+        engine.heartbeat_interval_s = 0.05
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        client.server_state = com.OPC_STATUS_NOCONFIG
+        client.server_state_text = "NOCONFIG"
+        with self.assertLogs("LightingControl", level="WARNING") as captured:
+            ok = await wait_until(
+                lambda: engine._last_abnormal_server_state is not None, timeout=5.0)
+        self.assertTrue(ok)
+        self.assertEqual(engine.state, OpcDaClientEngine.STATE_CONNECTED)
+        self.assertIn("abnormal", "\n".join(captured.output))
+
+    async def test_configure_hot_updates_rate_while_connected(self):
+        engine, factory = self.make_engine()
+        self.engine = engine
+        await engine.connect()
+        await engine.bootstrap()
+        client = factory.last()
+        engine.configure(update_rate_ms=1234)
+        self.assertEqual(engine.update_rate_ms, 1234)
+        self.assertEqual(client.update_rate_calls[-1], 1234)
 
 
 class TestHeartbeatSelfHeal(EngineTestBase):

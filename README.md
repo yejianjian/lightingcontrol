@@ -11,9 +11,17 @@
 > OPC Core Components / pywin32）：源码入口 [main_da.py](main_da.py)，
 > 支持自动扫描地址空间，也支持在设置页**手动单个添加/删除控制点位**（持久化，
 > 重连自动挂载；**已导入的别名不会再被手动加点/重连重新发布覆盖**）；
-> 打包产物 `dist/LightingControlDA_v1.2.1.exe`（66,630,927 bytes，md5 `6142d71d2729817a370d962e657e3546`；
-> 2026-11-17 重新打包，含手动加点别名保护、心跳看门狗自愈（链路状态实时显示“心跳 Xs 前”）、
-> 服务器列表远程枚举、分组与调度页三列布局、定时任务看门狗/补跑/即时重检等修复），
+> 打包产物 `dist/LightingControlDA_v1.2.4.exe`（62,045,783 bytes，md5 `c790c3960001f3fc98f3182edd0943e5`；
+> 2026-11-21 综合修复（v1.2.2 代码审查 + v1.2.3 实时质量/状态收尾 + v1.2.4 重连并发回归）：
+> **重连 supervisor 不再自我丢引用/并发双开，指数退避不再被 bootstrap 失败重置**；
+> **quality 回调支持 4 位置参数 / **kwargs（三参旧回调兼容）**；
+> **枚举线程保活引用改由 GUI 线程释放**；
+> 字符串点位 VARIANT 二次释放、链路故障被当作"坏点"导致假连接、服务器枚举线程生命周期、
+> COM 指针释放顺序、多余重连 supervisor、只读点误触发整链重连、批量写一坏全断、
+> S_FALSE 误判、心跳状态码、**实时 quality 同步（通信异常动态出现/恢复）**、
+> **connect 成功但 bootstrap 失败不再卡 loading**、**枚举改 daemon 线程（关窗不崩）**、
+> **热更新周期以服务器实际生效值为准**、**本机 FQDN 精确识别（Windows API，不误判同名远程主机）**、
+> 打包瘦身（排除 DA 版无用的 asyncua/cryptography，exe 约 -4.6 MB）等），
 > 构建脚本 [build_da.bat](build_da.bat)），使用说明与 DCOM 配置见
 > [docs/OPCDA_GUIDE.md](docs/OPCDA_GUIDE.md)。
 >

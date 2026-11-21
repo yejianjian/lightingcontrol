@@ -4,7 +4,7 @@
 连接/断开、浏览点位、实时订阅、分组控制、定时任务、日志、自动重连，复用同一套 PyQt5 界面与
 DataManager/调度器，仅替换通信引擎与设置页的连接配置区。
 
-- 入口：`main_da.py`（源码） / `dist/LightingControlDA_v1.2.1.exe`（打包产物）
+- 入口：`main_da.py`（源码） / `dist/LightingControlDA_v1.2.4.exe`（打包产物）
 - 引擎：`opcda/engine.py`（OpcDaClientEngine）
 - 低层 COM 客户端：`opcda/com.py` + `opcda/client.py`
 - 接口契约：`opcda_API_CONTRACT.md`
@@ -133,7 +133,7 @@ DataManager/调度器，仅替换通信引擎与设置页的连接配置区。
 build_da.bat
 ```
 
-使用 `venv38`（Python 3.8 + PyInstaller 6.19）生成 `dist\LightingControlDA_v1.2.1.exe`。
+使用 `venv38`（Python 3.8 + PyInstaller 6.19）生成 `dist\LightingControlDA_v1.2.4.exe`。
 可写数据（`da_connection` 配置、日志）在 exe 同级目录；只读资源打进 `_MEIPASS`。
 
 如现场只有 32 位 in-proc DA 服务器：准备 32 位 Python 3.8 + PyQt5(win32) + comtypes 的独立 venv，
@@ -156,7 +156,10 @@ build_da.bat
 | Qt/qasync 真实 UI | offscreen 启动 DaMainWindow：153 点发布到 DataManager、订阅 async、写入成功、pump_events_enabled=False |
 | 打包 exe | `dist/LightingControlDA_v1.1.0.exe`（66,617,731 bytes，md5 `abad1bbb742e92c27ec7ce0008dee818`；py3.8/PyInstaller onefile）。`tools/smoke_frozen_build.py` 全部 PASS；headless 启动后自动连接 Matrikon、浏览点位并发布、订阅建立；配置带 `da_manual_nodes` 时日志显示 `manual=1` 并自动挂载。 |
 | 服务器重启 | Matrikon 以 Windows 服务运行，停止/启动需要管理员权限（普通账号 `net stop` 被拒绝）；引擎的重连路径已由"假客户端模拟断线"自动化用例覆盖，现场可用管理员重启服务或在测试网关上验证 |
-| 打包 exe（v1.2.1，2026-11-17） | `dist/LightingControlDA_v1.2.1.exe`（66,630,927 bytes，md5 `6142d71d2729817a370d962e657e3546`；py3.8 / PyInstaller 6.19 onefile）。`tools/smoke_frozen_build.py` 全部 PASS（MainWindow 初始化、qasync 事件循环、系统托盘、`_MEIPASS` 资源、可写目录、1024x768 布局）。本版本包含：手动加点别名保护、心跳看门狗自愈（成功日志 DEBUG + 设置页“心跳 Xs 前”实时指示）、服务器列表 OPCEnum/远程注册表枚举、分组与调度页三列布局、定时任务看门狗/补跑/即时重检。 |
+| 打包 exe（v1.2.4，2026-11-21） | `dist/LightingControlDA_v1.2.4.exe`（62,045,783 bytes，md5 `c790c3960001f3fc98f3182edd0943e5`，sha256 `06685d5687e7bdea146ba2c8131baf5f371b34012644c898bd9746331fc5afae`；py3.8 / PyInstaller 6.19 onefile）。`tools/smoke_frozen_build.py` 全部 PASS（6/6）。相对 v1.2.1 体积减少约 4.6 MB：移除误打包的本机 data/lighting_config.json，基类 UA 引擎惰性导入并在 DA spec 排除 asyncua/cryptography/opc。 |
+| 重连回归修复（v1.2.4） | ① `_stop_reconnect_supervisor()` 在清空 `_reconnect_task` 前先判断 current_task，supervisor 自身调用 connect() 时保留引用，不再出现"双 supervisor 并发"；② `_handle_connection_lost()` 在 `_in_supervisor` 为真时跳过 `reconnect_attempt=0` 与重复创建 supervisor，bootstrap 持续失败时指数退避正常递增；③ supervisor finally 只清理自己的 `_reconnect_task` 引用；④ quality 回调新增 `keyword` 模式（3 位置参数 + **kwargs 用 quality= 传参），不再 TypeError；⑤ 枚举 daemon 线程的保活引用改由 GUI 线程 `finished` 槽释放，避免 QObject 在后台线程析构。 |
+| 追加修复（v1.2.3） | ① 实时推送回调增加可选 quality（4 参回调签名探测，兼容三参），DataManager 质量码随订阅/轮询实时更新——通信异常可动态出现并恢复；② connect 成功但 bootstrap 失败时按断线收尾（自动重连开→reconnecting；关→disconnected 并释放会话），不再永久卡 loading；③ 服务器枚举由 QThread 改为 daemon 线程 + Qt 信号回主线程，顶层 closeEvent 触发解绑/取消，退出阶段不再有 QThread 析构崩溃或访问已销毁控件；④ 更新周期热更新持久化/提示改用服务器 SetState 实际确认值；⑤ 移除"短名首段"本机判定，改用 Windows API 精确读取本机 FQDN（不做 DNS），同名短名的远程主机不再误判为本机。 |
+| 代码审查修复（v1.2.2） | ① 写字符串点位 VARIANT 所有权转移，消除 BSTR double-free；② AddItems/订阅按 HRESULT 区分点位级错误与链路故障，杜绝断线后"假 connected"；③ 服务器枚举 QThread parent=None + 保活集合，关闭窗口不再崩溃；④ COM 局部引用在 CoUninitialize 前释放；⑤ connect 成功不再多拉起 reconnect supervisor；⑥ 空点位表连接后手动加点会补启动订阅/轮询；⑦ 只读点位不绘制开关按钮、点位级写拒绝不计入连续失败；⑧ 批量写中单个坏类型点位只记该项错误，不阻断同批其他点位；⑨ S_FALSE/OPC_S_CLAMP 等正数 HRESULT 视为成功；⑩ 心跳识别 COMM_FAULT/FAILED、异常状态告警，监控表显示坏质量；⑪ 主线程不再做任意 DNS 解析，连接进度"取消"按钮真正生效；⑫ 分组页类型筛选支持 Float/Double/Int16/UInt16 语义；⑬ ProgID 校验支持空格与 CLSID，更新周期已连接可热更新；⑭ frozen 模式 root 日志落地；⑮ 打包瘦身。 |
 
 性能参考：153 点全量 AddItems 约 7ms、SyncRead 约 6ms、写入约 15ms 往返；订阅周期最小 100ms（默认 500ms）。
 
@@ -175,6 +178,16 @@ build_da.bat
   `(上次检查, 当前]` 逐分钟补跑（最多补最近 10 分钟）；(3) 计划在本分钟已检查后才添加/
   修改时，会立即重检当前分钟。同一计划同一分钟通过去重键只执行一次。若仍不执行，
   请确认计划已勾选启用、星期包含当天、目标分组存在且组内有成员。
+- **监控表一直显示"通信异常"/该恢复时不恢复**：实时订阅/轮询推送现在会把 OPC
+  质量码同步进 DataManager（引擎回调增加可选的第 4 个参数 quality），坏质量变好会
+  实时恢复、运行期掉线会实时变红；若长期 Bad，请检查服务器该点位的实际质量与设备状态。
+- **连接成功后状态卡在"正在加载节点/订阅"**：已修复——bootstrap（浏览/AddItems/
+  读初值/订阅）失败时会走断线收尾：自动重连开启进入"重连中"，关闭则回到"未连接"
+  并释放会话，不会再永久停在 loading。
+- **关闭窗口时正在刷新服务器列表会崩溃**：已修复——服务器枚举改为 daemon 线程 +
+  结果信号回主线程，关闭窗口不会销毁运行中的线程（不再有 QThread 析构崩溃）。
+- **更新周期提示的值和实际不一致**：现在以服务器 SetState 返回的实际生效周期为准
+  持久化并提示（服务器不支持调速时提示"请求 Xms，服务器已确认 Yms"）。
 - **心跳日志看不到**：这是按现场要求设计的行为——周期心跳成功日志是 DEBUG 级（移出 INFO
   分类），默认「全部/INFO」看不到，且每 6 次探测才记 1 条（默认约 60 秒一条）。三种确认方式：
   (1) 设置页「链路状态」实时显示 **“心跳正常（Xs 前，每 10s 探测）”**，超过 3 个周期未更新

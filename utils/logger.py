@@ -202,16 +202,37 @@ def setup_logger():
 
 
 def _install_root_handler(app_logger):
-    """给 root logger 挂一个轻量 handler，只收第三方/标准库的 WARNING 以上记录。"""
+    """给 root logger 挂一个轻量 handler，只收第三方/标准库的 WARNING 以上记录。
+
+    打包后 console=False 时 sys.stderr / sys.stdout 可能都是 None，此时 StreamHandler
+    会拿不到可写流，root 级记录（例如 asyncio 的 "Task exception was never retrieved"）
+    就落不了盘。因此 stdio 都不可用时复用 app_logger 已经打开的文件 handler（同一
+    app.log、同一噪声过滤器）；若连文件 handler 也没有（日志目录全不可写），退化为
+    NullHandler，保证这里任何情况下都不抛异常。
+    """
     root = logging.getLogger()
     if getattr(root, "_lightingcontrol_bridge", False):
         return
     try:
-        handler = logging.StreamHandler(sys.stderr if sys.stderr else sys.stdout)
-        handler.setLevel(logging.WARNING)
-        handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(name)s - %(message)s'))
-        handler.addFilter(_new_library_filter())
+        stream = sys.stderr if sys.stderr is not None else sys.stdout
+        if stream is not None:
+            handler = logging.StreamHandler(stream)
+            handler.setLevel(logging.WARNING)
+            handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(name)s - %(message)s'))
+            handler.addFilter(_new_library_filter())
+        else:
+            # console=False：没有 stdio，只能落文件。复用 app_logger 的文件 handler，
+            # 保证写的是同一个 app.log，且已带 LibraryNoiseFilter。
+            handler = None
+            for existing in getattr(app_logger, "handlers", ()) or ():
+                if isinstance(existing, logging.FileHandler):
+                    handler = existing
+                    break
+            if handler is None:
+                # 连文件都不可写：用 NullHandler 占位，避免 root 记录没有 handler 时报错
+                handler = logging.NullHandler()
         root.addHandler(handler)
+        # root 仍只收 WARNING 以上；app_logger 的 propagate=False，因此不会重复写盘
         if root.level == logging.NOTSET or root.level > logging.WARNING:
             root.setLevel(logging.WARNING)
         root._lightingcontrol_bridge = True

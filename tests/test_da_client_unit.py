@@ -391,6 +391,80 @@ class TestServerEnumerationWithoutCom(unittest.TestCase):
         self.assertEqual(servers, sorted(set(servers)))
 
 
+class TestErrorClassification(unittest.TestCase):
+    """链路故障 vs 点位级业务错误的判定（防止假连接/误重连）。"""
+
+    def test_item_level_codes(self):
+        for code in (com.OPC_E_UNKNOWNITEMID, com.OPC_E_BADRIGHTS, com.OPC_E_BADTYPE,
+                     com.OPC_E_INVALIDITEMID, com.OPC_E_WRITEONLY):
+            self.assertTrue(com.is_item_level_error(code), hex(code))
+            self.assertFalse(com.is_link_level_error(code), hex(code))
+
+    def test_link_level_codes(self):
+        for code in (com.RPC_S_CALL_FAILED, com.RPC_E_DISCONNECTED,
+                     com.E_ACCESSDENIED, com.E_FAIL, com.RPC_S_SERVER_UNAVAILABLE):
+            self.assertTrue(com.is_link_level_error(code), hex(code))
+        # 拿不到 HRESULT 的异常（RPC 层 OSError 等）保守按链路故障处理
+        self.assertTrue(com.is_link_level_error(None))
+
+    def test_write_denied_is_item_level_for_write_results(self):
+        self.assertTrue(com.is_item_level_write_error(com.E_ACCESSDENIED))
+        self.assertTrue(com.is_item_level_write_error(com.OPC_E_BADRIGHTS))
+        self.assertFalse(com.is_item_level_write_error(com.RPC_S_CALL_FAILED))
+
+    def test_local_fqdn_is_recognized_without_dns(self):
+        """本机 FQDN 用 Windows API（非 DNS）识别；远程同短名域名仍判为远程。"""
+        try:
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(256)
+            size = ctypes.c_ulong(len(buffer))
+            ok = ctypes.windll.kernel32.GetComputerNameExW(3, buffer, ctypes.byref(size))
+        except Exception:
+            self.skipTest("非 Windows 环境")
+        if not ok or not buffer.value:
+            self.skipTest("无法读取本机 FQDN")
+        fqdn = str(buffer.value).strip().lower()
+        self.assertTrue(da_client._is_local_host(fqdn))
+        if "." in fqdn:
+            self.assertFalse(da_client._is_local_host(fqdn.split(".", 1)[0] + ".other.example"))
+
+    def test_local_host_does_not_match_same_short_name_remote_fqdn(self):
+        """远程主机短名与本机同名时不能被误判为本机（忽略 DCOM machine 参数）。"""
+        short = socket.gethostname().split(".", 1)[0].strip().lower()
+        if not short:
+            self.skipTest("无法获取本机短主机名")
+        self.assertFalse(da_client._is_local_host(short + ".site2.local"))
+        self.assertFalse(da_client._is_local_host(short + ".other.domain.example"))
+
+    def test_async_unsupported_codes(self):
+        for code in (com.E_NOINTERFACE, com.E_NOTIMPL,
+                     com.CONNECT_E_NOCONNECTION, com.CONNECT_E_ADVISELIMIT):
+            self.assertTrue(com.is_async_unsupported_error(code), hex(code))
+        self.assertFalse(com.is_async_unsupported_error(com.RPC_E_DISCONNECTED))
+
+
+class TestVariantOwnership(unittest.TestCase):
+    """写字符串点位时的 VARIANT 所有权转移（double-free 回归）。"""
+
+    def test_move_variant_into_slot_neutralizes_source(self):
+        variant = com.python_to_variant("hello", com.VT_BSTR)
+        self.assertEqual(variant.vt, com.VT_BSTR)
+        slots = (VARIANT * 1)()
+        da_client._move_variant_into_slot(slots, 0, variant)
+        # 源 VARIANT 已置空：其析构不会再对同一 BSTR 调 VariantClear
+        self.assertEqual(variant.vt, com.VT_EMPTY)
+        self.assertEqual(slots[0].vt, com.VT_BSTR)
+        com.variant_clear(slots[0])
+        self.assertEqual(slots[0].vt, com.VT_EMPTY)
+
+    def test_python_to_variant_bstr_roundtrip(self):
+        variant = com.python_to_variant("灯控", com.VT_BSTR)
+        try:
+            self.assertEqual(com.variant_to_python(variant), "灯控")
+        finally:
+            com.variant_clear(variant)
+
+
 class TestModuleApi(unittest.TestCase):
     REQUIRED_CLIENT_NAMES = (
         'OpcDaClient', 'OpcDaError', 'DaItem', 'DaValue',

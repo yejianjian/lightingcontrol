@@ -134,6 +134,11 @@ E_FAIL = 0x80004005
 E_UNEXPECTED = 0x8000FFFF
 E_INVALIDARG = 0x80070057
 E_ACCESSDENIED = 0x80070005
+# OLE 连接点错误（FindConnectionPoint/Advise 失败）——属"服务器不支持回调订阅"，
+# 可安全降级为 SyncRead 轮询，不代表链路故障。
+CONNECT_E_ADVISELIMIT = 0x80040201
+CONNECT_E_NOCONNECTION = 0x80040202
+CONNECT_E_CANNOTCONNECT = 0x80040203
 REGDB_E_CLASSNOTREG = 0x80040154
 CO_E_NOTINITIALIZED = 0x800401F0
 CO_E_OBJNOTCONNECTED = 0x800401FD
@@ -688,6 +693,67 @@ def succeeded(code):
     if code is None:
         return True
     return as_signed(code) >= 0
+
+
+# --------------------------------------------------------------------------------------
+# 错误分类：区分"点位级业务错误"与"链路/传输故障"
+#
+# 现场教训：AddItems/Read 的异常文本里含"点位"二字，旧实现用关键字判断"部分点位
+# 无效"，会把 RPC/DCOM 链路崩溃也当成坏点忽略，随后在已断开的 COM 对象上把状态
+# 推到 connected（假连接）。必须按 HRESULT 码严格区分。
+# --------------------------------------------------------------------------------------
+
+# 只影响单个 ItemID 的业务错误（坏点/权限/类型/范围），不代表链路已死
+_ITEM_LEVEL_ERRORS = frozenset((
+    OPC_E_INVALIDHANDLE, OPC_E_BADTYPE, OPC_E_BADRIGHTS, OPC_E_UNKNOWNITEMID,
+    OPC_E_INVALIDITEMID, OPC_E_UNKNOWNPATH, OPC_E_RANGE, OPC_E_DUPLICATENAME,
+    OPC_E_NOTFOUND, OPC_E_INVALIDDATATYPE, OPC_E_WRITEONLY,
+))
+
+# 服务器不支持异步订阅接口/回调连接点时允许降级为轮询（不是链路故障）
+_ASYNC_UNSUPPORTED_ERRORS = frozenset((
+    E_NOINTERFACE, E_NOTIMPL, E_POINTER,
+    CONNECT_E_ADVISELIMIT, CONNECT_E_NOCONNECTION, CONNECT_E_CANNOTCONNECT,
+))
+
+
+def is_item_level_error(code):
+    """该 HRESULT 是否为点位级业务错误（只影响单个点位，不触发整链重连）。"""
+    unsigned = as_unsigned(code)
+    return unsigned in _ITEM_LEVEL_ERRORS
+
+
+def is_async_unsupported_error(code):
+    """该 HRESULT 是否表示服务器不支持 IOPCAsyncIO2（可安全降级为轮询）。"""
+    unsigned = as_unsigned(code)
+    return unsigned in _ASYNC_UNSUPPORTED_ERRORS
+
+
+# 写操作的"点位级"拒绝：除 OPC 点位错误外，服务器还可能用 E_ACCESSDENIED /
+# E_INVALIDARG 表示"该点位不可写/值不合法"，同样不应触发整链重连。
+_WRITE_ITEM_LEVEL_ERRORS = _ITEM_LEVEL_ERRORS | frozenset((E_ACCESSDENIED, E_INVALIDARG))
+
+
+def is_item_level_write_error(code):
+    """写结果数组里的 HRESULT 是否属于点位级拒绝（只读/类型/坏点）。"""
+    unsigned = as_unsigned(code)
+    return unsigned in _WRITE_ITEM_LEVEL_ERRORS
+
+
+def is_link_level_error(code):
+    """该 HRESULT 是否属于链路/传输故障（需要上抛并触发重连）。
+
+    保守策略：任何失败 HRESULT 只要不是明确的点位级业务错误，都按链路故障处理；
+    code 为 None（拿不到 HRESULT，例如 RPC 层直接抛的 OSError）同样按链路故障处理。
+    """
+    if code is None:
+        return True
+    unsigned = as_unsigned(code)
+    if unsigned is None:
+        return True
+    if is_item_level_error(unsigned):
+        return False
+    return as_signed(unsigned) < 0
 
 
 _HRESULT_TEXT = {
@@ -1469,8 +1535,11 @@ def com_initialized():
     return bool(getattr(_apartment_state, 'initialized', False))
 
 
-# 远程 DCOM 安全初始化（进程级，只在首次远程连接时尝试）
+# 远程 DCOM 安全初始化（进程级，只在首次远程连接时尝试）。
+# CoInitializeSecurity 是进程级一次性调用；UI 线程与"刷新服务器列表"工作线程可能
+# 并发首次触发，必须加锁，否则两个线程同时调用会得到 RPC_E_TOO_LATE/失败。
 _security_initialized = [False]
+_security_lock = threading.Lock()
 
 
 def try_init_dcom_security():
@@ -1479,22 +1548,23 @@ def try_init_dcom_security():
     本机连接不需要；远程 DCOM 时如果不设置，某些服务器会拒绝（E_ACCESSDENIED）。
     进程内一旦有别的组件先设置过，会返回 RPC_E_TOO_LATE，属正常情况，忽略即可。
     """
-    if _security_initialized[0]:
-        return True
-    _security_initialized[0] = True
-    if _ole32 is None:  # pragma: no cover
-        return False
-    try:
-        func = _ole32.CoInitializeSecurity
-        func.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p,
-                         ctypes.c_void_p, DWORD, DWORD, ctypes.c_void_p,
-                         DWORD, ctypes.c_void_p]
-        func.restype = ctypes.c_long
-        # RPC_C_AUTHN_LEVEL_CONNECT=2, RPC_C_IMP_LEVEL_IMPERSONATE=3, EOAC_NONE=0
-        result = func(None, -1, None, None, 2, 3, None, 0, None)
-        return as_signed(result) >= 0 or as_unsigned(result) == RPC_E_TOO_LATE
-    except Exception:  # pragma: no cover
-        return False
+    with _security_lock:
+        if _security_initialized[0]:
+            return True
+        _security_initialized[0] = True
+        if _ole32 is None:  # pragma: no cover
+            return False
+        try:
+            func = _ole32.CoInitializeSecurity
+            func.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p,
+                             ctypes.c_void_p, DWORD, DWORD, ctypes.c_void_p,
+                             DWORD, ctypes.c_void_p]
+            func.restype = ctypes.c_long
+            # RPC_C_AUTHN_LEVEL_CONNECT=2, RPC_C_IMP_LEVEL_IMPERSONATE=3, EOAC_NONE=0
+            result = func(None, -1, None, None, 2, 3, None, 0, None)
+            return as_signed(result) >= 0 or as_unsigned(result) == RPC_E_TOO_LATE
+        except Exception:  # pragma: no cover
+            return False
 
 
 __all__ = [

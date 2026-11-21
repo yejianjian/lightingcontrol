@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================
 rem  OPC DA edition single-file build (Windows Server 2012 target)
-rem  Output: dist\LightingControlDA_v1.2.1.exe
+rem  Output: dist\LightingControlDA_v1.2.4.exe
 rem
 rem  NOTE: keep this file ASCII-only. A UTF-8 .bat is misread by
 rem  cmd.exe before "chcp 65001" takes effect, which garbles the
@@ -10,7 +10,7 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set APP_NAME=LightingControlDA_v1.2.1
+set APP_NAME=LightingControlDA_v1.2.4
 set SPEC=LightingControlDA.spec
 
 echo ============================================================

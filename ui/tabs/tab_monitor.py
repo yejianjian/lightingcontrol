@@ -75,6 +75,53 @@ class MonitorSearchProxyModel(QSortFilterProxyModel):
         return True
 
 
+# OPC 质量码的高位掩码：0xC0=Good、0x40=Uncertain、0x00=Bad。
+# 引擎已把 quality 存进节点字典，但表格原先只显示值，坏质量在界面上完全看不见。
+_QUALITY_GOOD = 0xC0
+
+
+def _quality_class(quality):
+    """把 OPC 质量码归一化为 'good' / 'uncertain' / 'bad'。
+
+    质量缺失（None）按 Good 处理：OPC UA 版节点没有 quality 字段，不能因此
+    把整列标成通信异常。
+    """
+    if quality is None:
+        return 'good'
+    try:
+        code = int(quality) & 0xC0
+    except (TypeError, ValueError):
+        text = str(quality).strip().lower()
+        if not text or text.startswith('good'):
+            return 'good'
+        if text.startswith('uncertain'):
+            return 'uncertain'
+        return 'bad'
+    if code == _QUALITY_GOOD:
+        return 'good'
+    if code == 0x40:
+        return 'uncertain'
+    return 'bad'
+
+
+def _format_value_text(val):
+    """状态列的值文本：布尔保持「开启/关闭」，其余保持原有 str 格式。"""
+    if isinstance(val, bool):
+        return "开启" if val else "关闭"
+    return str(val) if val is not None else "等待更新"
+
+
+def _format_status_text(node):
+    """状态列显示文本：质量非 Good 时附加「（通信异常）」提示。"""
+    val = node.get('value')
+    quality = _quality_class(node.get('quality'))
+    if quality == 'good':
+        return _format_value_text(val)
+    if val is None:
+        return "通信异常"
+    return _format_value_text(val) + "（通信异常）"
+
+
 class MonitorTableModel(QAbstractTableModel):
     def __init__(self, data_manager):
         super().__init__()
@@ -128,9 +175,7 @@ class MonitorTableModel(QAbstractTableModel):
             if col == 1: return node.get('alias', node.get('name', ''))
             if col == 2: return node.get('type', '')
             if col == 3: 
-                val = node.get('value')
-                if isinstance(val, bool): return "开启" if val else "关闭"
-                return str(val) if val is not None else "等待更新"
+                return _format_status_text(node)
             if col == 4: return node.get('timestamp', '')
             
         elif role == Qt.EditRole and col == 1:
@@ -138,6 +183,11 @@ class MonitorTableModel(QAbstractTableModel):
             
         elif role == Qt.ForegroundRole:
             if col == 3:
+                quality = _quality_class(node.get('quality'))
+                if quality == 'bad':
+                    return QColor("red")      # Bad：通信异常
+                if quality == 'uncertain':
+                    return QColor("orange")   # Uncertain：质量不确定
                 val = node.get('value')
                 if isinstance(val, bool):
                      return QColor("red") if not val else QColor("green")

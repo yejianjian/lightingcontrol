@@ -6,14 +6,13 @@
 # 放在 exe 同级目录，保证重启后仍然存在。
 import os
 
-# 数据文件（与 UA 版一致）
+# 只打包只读资源；data/lighting_config.json 属于运行时可写数据，
+# 由 utils.paths.get_app_path() 放在 exe 同级 data/ 目录读取，不要打进 _MEIPASS。
+# 否则用户改配置会写成"临时的解压副本"，重启后丢失。
 datas = []
 os_path = os.path.join(os.getcwd(), 'ui', 'style.qss')
 if os.path.exists(os_path):
     datas.append(('ui/style.qss', 'ui'))
-data_json_src = os.path.join(os.getcwd(), 'data', 'lighting_config.json')
-if os.path.exists(data_json_src):
-    datas.append(('data/lighting_config.json', 'data'))
 icon_png = os.path.join(os.getcwd(), 'lighting_logo.png')
 if os.path.exists(icon_png):
     datas.append(('lighting_logo.png', '.'))
@@ -83,10 +82,11 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # 注意：不能排除 asyncua / cryptography。ui/main_window.py 无条件 import
-    # opc.client_engine（UA 引擎），DA 版复用同一个 MainWindow 基类，因此这些
-    # 依赖在导入期就必须存在；排除它们会让 exe 启动即 ModuleNotFoundError。
-    excludes=['PySide6', 'shiboken6'],
+    # DA 版不需要 OPC UA 依赖：ui/main_window.py 已把 UA 引擎改为 __init__ 内惰性导入，
+    # DA 子类把 ENGINE_CLASS 换成 OpcDaClientEngine，导入期完全不触碰 opc.client_engine，
+    # 因此可以安全排除 asyncua / cryptography（后者会带入 openssl 等二进制）与 opc 包，
+    # 显著减小 exe 体积。保留 PySide6/shiboken6：DA 版界面同样基于 Qt。
+    excludes=['PySide6', 'shiboken6', 'asyncua', 'cryptography', 'opc', 'opc.client_engine'],
     noarchive=False,
     optimize=0,
 )
@@ -98,7 +98,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='LightingControlDA_v1.2.1',
+    name='LightingControlDA_v1.2.4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

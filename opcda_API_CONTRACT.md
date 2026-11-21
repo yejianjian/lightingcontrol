@@ -65,10 +65,19 @@ class OpcDaClient:
         # server_handle/client_handle；失败的 item 不返回（或抛带错误列表的 OpcDaError）。
     def read_items(self, item_ids: Sequence[str] | None = None, source: int = 1) -> list[DaValue]: ...
         # source: 1=CACHE, 2=DEVICE；item_ids 为空表示 reading() 返回的全部已挂载点位。
+        # DaValue.error 只在真正的失败 HRESULT 时非 0；S_FALSE / OPC_S_CLAMP 等正数
+        # HRESULT 属成功提示，不得当作读失败丢弃数值。
     def write_items(self, values: Mapping[str, object]) -> list[tuple[str, int, str]]: ...
         # 返回 [(item_id, hresult, error_text)]；按 canonical_vt 构造 VARIANT。
+        # 单个点位类型不兼容/数组类型/只读时只记该项错误，继续下发同批其他点位；
+        # 仅整批 COM 调用失败（链路问题）才抛 OpcDaError。
+        # 错误分类：com.is_item_level_error / is_item_level_write_error 判断点位级
+        # 业务错误（OPC_E_*、写结果里的 E_ACCESSDENIED 等），is_link_level_error
+        # 判断链路/传输故障（RPC/CO_E/E_FAIL 等）。引擎据此决定是否触发整链重连。
     def set_data_change_callback(self, callback) -> None: ...
         # callback(list[DaValue])，在调用线程的 COM 消息泵中触发。
+        # DaValue.quality 必须随每次推送一起回传（引擎再转给 UI），否则监控页
+        # 无法实时显示/恢复「通信异常」状态。
     def start_subscription(self, update_rate_ms: int = 500) -> None: ...
     def stop_subscription(self) -> None: ...
     def get_error_string(self, code: int) -> str: ...
@@ -80,6 +89,11 @@ def pump_events() -> None: ...  # 模块级，同上
 实现要求：
 - 订阅优先 IOPCAsyncIO2 + IOPCDataCallback（connection point）；服务器不支持时
   `start_subscription` 抛 `OpcDaError("async unsupported")`，由引擎降级为 SyncRead 轮询。
+- 引擎对 UI 的逐点推送回调为 `callback(node_id, value, timestamp[, quality])`：
+  回调可接收第 4 个位置参数时按位置推送、恰好 3 个位置参数 + `**kwargs` 时用
+  `quality=` 关键字推送实时 OPC 质量码（监控页「通信异常」状态依赖它动态出现/
+  恢复）；旧三参回调按签名探测保持兼容。质量码同时写入 DataManager 节点的
+  `quality` 字段。
 - 所有服务器返回的数组/字符串用 CoTaskMemFree 释放；BSTR 注意不要重复释放。
 - VARTYPE→Python 与 Python→VARIANT 的转换集中提供：
   `vtype_to_type_name(vt) -> str`（Boolean/Int16/Int32/UInt16/UInt32/Int64/UInt64/Float/Double/String/Unknown）
@@ -135,7 +149,7 @@ def pump_events() -> None: ...  # 模块级，同上
   `ENGINE_CLASS = OpcDaClientEngine`、`SETTINGS_CLASS = DaTabSettings`，标题改为 DA 版。
 - `main_da.py`：与 main.py 相同，仅使用 DaMainWindow；日志加一行协议信息。
 - `LightingControlDA.spec` + `build_da.bat`：单文件打包 py3.8/venv38，输出
-  `dist/LightingControlDA_v1.2.1.exe`；hiddenimports 至少 comtypes、comtypes.client、
+  `dist/LightingControlDA_v1.2.4.exe`；hiddenimports 至少 comtypes、comtypes.client、
   comtypes.automation、comtypes.typeinfo、comtypes.connectionpoints；
   数据文件与 UA 版一致（ui/style.qss、data/lighting_config.json、lighting_logo.png）。
 - 现有 `ui/main_window.py` 已由 Lead 改造出 `ENGINE_CLASS`/`SETTINGS_CLASS` 插槽，

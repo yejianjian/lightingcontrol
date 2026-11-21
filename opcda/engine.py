@@ -37,6 +37,7 @@ import random
 import time
 
 from utils.logger import global_logger
+from . import com
 
 
 # --------------------------------------------------------------------------------------
@@ -80,12 +81,15 @@ RECONNECT_JITTER = 0.2
 MIN_RECONNECT_DELAY = 0.01
 
 # OPC DA 服务器状态码（OPCSERVERSTATE）
-_OPC_STATE_RUNNING = 1
-_OPC_STATE_FAILED = 2
-_OPC_STATE_NODATA = 3
-_OPC_STATE_HOLD = 4
-_OPC_STATE_NOCONFIG = 5
-_OPC_STATE_SUSPENDED = 6
+# OPC 服务器状态码：统一引用 com.py 的规范常量。
+# 旧实现本地定义与 OPC 规范错位（把 3 当 NODATA、5 当 NOCONFIG），且只识别
+# FAILED，通信故障（COMM_FAULT）等异常状态完全无告警。
+_OPC_STATE_RUNNING = com.OPC_STATUS_RUNNING
+_OPC_STATE_FAILED = com.OPC_STATUS_FAILED
+_OPC_STATE_NOCONFIG = com.OPC_STATUS_NOCONFIG
+_OPC_STATE_SUSPENDED = com.OPC_STATUS_SUSPENDED
+_OPC_STATE_TEST = com.OPC_STATUS_TEST
+_OPC_STATE_COMM_FAULT = com.OPC_STATUS_COMM_FAULT
 
 # OPC DA 品质：高两位是质量主状态，Good = 0b11（0xC0），Bad = 0b00。
 _QUALITY_GOOD_MASK = 0xC0
@@ -182,11 +186,11 @@ def _quality_is_good(quality):
 
 
 def _hresult_ok(hresult):
-    """HRESULT 成功判定（0 / S_OK；容忍无符号表示）。"""
+    """HRESULT 成功判定（S_OK 与 S_FALSE 等正数码都算成功）。"""
     if hresult is None:
         return False
     try:
-        return int(hresult) == 0
+        return com.succeeded(int(hresult))
     except (TypeError, ValueError):
         return False
 
@@ -282,6 +286,9 @@ class OpcDaClientEngine:
 
         # 订阅/回调
         self._sub_callback = None
+        # 回调接收 quality 的方式："positional"（4+ 位置参数/*args）、
+        # "keyword"（3 参数 + **kwargs）或 "none"（旧三参回调）。
+        self._sub_cb_quality_mode = "none"
         self._subscribed_items = []
         self._subscription_mode = None
         # 客户端句柄与 ItemID 的映射（订阅回调只给 hClient，需要此表还原点位）
@@ -319,6 +326,8 @@ class OpcDaClientEngine:
         self._connected_at = 0.0
         self._last_data_at = 0.0
         self._last_heartbeat_at = 0.0
+        # 最近一次已告警的异常服务器状态（避免每 10s 重复刷同一条 WARNING）
+        self._last_abnormal_server_state = None
         # 心跳周期覆盖值（秒）。默认 None 表示由 session_timeout_ms 推导；测试可调小。
         self.heartbeat_interval_s = None
         # 是否由引擎主动泵 Windows 消息。
@@ -410,7 +419,25 @@ class OpcDaClientEngine:
                 self.prog_id = new_prog
                 endpoint_changed = True
         if update_rate_ms is not None:
-            self.update_rate_ms = self._clamp_update_rate(update_rate_ms)
+            requested_rate = self._clamp_update_rate(update_rate_ms)
+            if requested_rate != self.update_rate_ms:
+                self.update_rate_ms = requested_rate
+                # 已连接时原地 SetState 修改组更新周期（不重建组、不中断订阅）。
+                # 旧实现只改本地字段，必须断开重连才生效。
+                client = self.client
+                apply_rate = getattr(client, "set_update_rate_ms", None)
+                if self.connected and callable(apply_rate):
+                    try:
+                        applied = apply_rate(requested_rate)
+                        if applied:
+                            self.update_rate_ms = self._clamp_update_rate(applied)
+                        global_logger.info(
+                            "OPC DA update rate applied: requested={}ms, effective={}ms".format(
+                                requested_rate, self.update_rate_ms))
+                    except Exception as e:
+                        global_logger.warning(
+                            "应用新的更新周期失败（保持 {}ms）：{}".format(
+                                self.update_rate_ms, e))
         if browse_max_depth is not None:
             self.browse_max_depth = self._clamp_browse_depth(browse_max_depth)
         if manual_items is not None:
@@ -429,12 +456,46 @@ class OpcDaClientEngine:
             self._items_added_client = None
         return True
 
+    @staticmethod
+    def _callback_quality_mode(callback):
+        """判断回调接收 quality 的方式：positional / keyword / none。
+
+        - 4 个及以上位置参数，或含 *args：按第 4 个位置参数传 quality；
+        - 恰好 3 个位置参数 + **kwargs：用关键字参数 quality= 传（避免 TypeError）；
+        - 其余（含旧三参回调、内建不可签名对象）：不传 quality。
+        """
+        if not callable(callback):
+            return "none"
+        try:
+            import inspect
+            signature = inspect.signature(callback)
+        except (TypeError, ValueError):  # C 函数/内建可调用对象：保守按三参处理
+            return "none"
+        positional = 0
+        has_var_kwargs = False
+        for param in signature.parameters.values():
+            if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+                positional += 1
+            elif param.kind == param.VAR_POSITIONAL:
+                return "positional"
+            elif param.kind == param.VAR_KEYWORD:
+                has_var_kwargs = True
+        if positional >= 4:
+            return "positional"
+        if has_var_kwargs:
+            return "keyword"
+        return "none"
+
     def set_subscription_callback(self, callback):
-        """登记数据推送回调（每个点位一次 callback(node_id, value, timestamp)）。
+        """登记数据推送回调（callback(node_id, value, timestamp[, quality])）。
 
         重连后引擎会自动用它重建订阅；这里只保存引用。
+
+        质量码 quality 是监控页显示「通信异常」/恢复正常的唯一实时来源：若回调
+        能接收第 4 个参数就一并推送；旧的三参回调保持原有调用语义。
         """
         self._sub_callback = callback
+        self._sub_cb_quality_mode = self._callback_quality_mode(callback)
 
     # ----------------------------------------------------------------------------------
     # 手动添加点位（自动扫描之外的补充）
@@ -583,6 +644,21 @@ class OpcDaClientEngine:
 
         if not any(spec.get("item_id") == item_id for spec in self.manual_items):
             self.manual_items.append({"item_id": item_id, "name": str(name or node.get("name") or item_id)})
+
+        # 首次连接时若自动扫描为 0 且没有手动点位，bootstrap() 会跳过订阅/轮询
+        # （不挂回调、不启 poll）。之后手动新增点位必须补启动，否则该点位后续的
+        # 值永远不会自动刷新（界面停在初值）。
+        if self._subscription_mode is None and self._sub_callback is not None:
+            try:
+                await self.start_subscription(self._sub_callback)
+            except asyncio.CancelledError:
+                raise
+            except ConnectionSuperseded:
+                raise
+            except Exception as e:
+                global_logger.warning(
+                    "手动点位 {} 已挂载，但补启动订阅/轮询失败：{}".format(item_id, e))
+
         global_logger.info(
             "[MANUAL] Added OPC DA item {} (name={}, type={}, value={!r}).".format(
                 item_id, node.get("name"), node.get("type"), node.get("value")))
@@ -746,6 +822,7 @@ class OpcDaClientEngine:
         """
         self._ensure_locks()
         self._connecting = True
+        connected_ok = False
         try:
             async with self._client_lock:
                 my_gen = self._generation + 1
@@ -754,13 +831,16 @@ class OpcDaClientEngine:
                 await self._stop_reconnect_supervisor()
                 await self._cleanup_client()
                 await self._connect_once(my_gen)
+                connected_ok = True
                 return True
         finally:
             self._connecting = False
-            # 用户发起的连接失败后，若自动重连总闸还开着，要把 supervisor 重新拉起来；
-            # 但如果本次 connect 就是 supervisor 自己发起的，则不能重复创建（否则会
-            # 同时存在两个 supervisor）。
-            if (not self.connected and self._auto_reconnect and not self._in_supervisor
+            # 只有本次建链**实际失败**才重新拉起重连 supervisor。
+            # 修复前用 "not self.connected" 判断：connect() 成功返回时状态是
+            # STATE_LOADING（connected=False），于是每次正常连接都会多创建一个
+            # supervisor（0.5s 后自行退出并打 WARNING），且启动时与自动连接竞态。
+            if (not connected_ok and not self.connected and self._auto_reconnect
+                    and not self._in_supervisor
                     and (self._reconnect_task is None or self._reconnect_task.done())):
                 self._reconnect_task = asyncio.create_task(self._reconnect_supervisor())
 
@@ -850,10 +930,11 @@ class OpcDaClientEngine:
             raise ConnectionError("bootstrap() requires an established connection")
 
         self._loading = True
+        # 在 try 之外先捕获世代：装配失败时据此收尾状态机（见下方 except）。
+        my_gen = self._generation
         try:
-            # 捕获本次装配的世代与客户端：装配过程中若心跳/读写检测到断线（或用户断开），
+            # 捕获本次装配的客户端：装配过程中若心跳/读写检测到断线（或用户断开），
             # 绝不能在最后一步把状态错误地推回 connected。
-            my_gen = self._generation
             client = self.client
             self._set_state(self.STATE_LOADING, "loading nodes", **self._status_detail())
 
@@ -898,6 +979,32 @@ class OpcDaClientEngine:
             # 装配完成后再次确认心跳/轮询任务仍在运行：防止长耗时 AddItems/Read
             # 期间任务静默退出（含僵尸 pending 与轮询降级任务），与 UA 版对齐。
             await self._ensure_link_tasks(my_gen)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 装配失败（browse/AddItems/读初值/订阅）必须收尾状态机。
+            # 修复前 bootstrap 抛错后状态停在 STATE_LOADING：connect 已成功、
+            # GetStatus 仍正常，心跳不会判断线，界面永远显示"正在加载节点/订阅"，
+            # 也不会触发重连。这里按断线路径收尾：
+            #   自动重连开启 -> reconnecting（supervisor 接手重试）；
+            #   自动重连关闭 -> disconnected 并释放已建立的 COM 会话。
+            try:
+                if my_gen == self._generation and self._state in (
+                        self.STATE_LOADING, self.STATE_CONNECTED):
+                    self._handle_connection_lost(
+                        "bootstrap failed: {}".format(exc), my_gen)
+                    if not self._auto_reconnect:
+                        try:
+                            await self._cleanup_client()
+                        except Exception as cleanup_exc:
+                            global_logger.debug(
+                                "bootstrap failure cleanup error: {}".format(cleanup_exc))
+                        self._set_state(self.STATE_DISCONNECTED,
+                                        "bootstrap failed (auto-reconnect disabled)")
+            except Exception as state_exc:
+                global_logger.error(
+                    "bootstrap failure cleanup failed: {}".format(state_exc), exc_info=True)
+            raise
         finally:
             self._loading = False
         cb = self.on_nodes_recovered
@@ -1068,20 +1175,28 @@ class OpcDaClientEngine:
         return added
 
     def _is_partial_additems_error(self, error):
-        """区分"部分点位无效"与"链路已死"。
+        """区分"部分点位无效"与"链路已死"（按 HRESULT 严格判定）。
 
         契约允许 add_items 对失败的 item 抛带错误列表的 OpcDaError。这类错误
         不应触发整条连接重连（否则一个坏点名就能让 24/7 系统反复重建链路）；
         而 RPC/未连接/CreateObject 之类错误必须上抛，由重连 supervisor 处理。
+
+        修复前用关键字匹配（包含中文『点位』）判断部分失败，而底层 AddItems
+        链路崩溃时的异常文本是『批量添加点位失败（N 个）』也含『点位』，结果把
+        整批链路故障当成坏点忽略，最终在已断开的 COM 对象上把状态推进到
+        connected（假连接）。现在只认逐项错误列表，且要求**全部**是点位级业务错误。
         """
         errors = getattr(error, "errors", None)
-        if errors:
-            return True
-        text = str(error).lower()
-        item_markers = ("item", "itemid", "点位", "unknown item", "invalid")
-        if any(marker in text for marker in item_markers):
-            return True
-        return False
+        if not errors:
+            return False
+        for entry in errors:
+            try:
+                code = entry[1]
+            except (TypeError, IndexError):
+                code = None
+            if not com.is_item_level_error(code):
+                return False
+        return True
 
     async def _refresh_node_values(self):
         """SyncRead(CACHE) 一次全量初值（重连后同时补齐断线期间的变化）。"""
@@ -1106,6 +1221,13 @@ class OpcDaClientEngine:
             except Exception as e:
                 failures += 1
                 last_error = e
+                code = getattr(e, "code", None)
+                if code is None or com.is_link_level_error(code):
+                    # 链路级读取失败不能吞掉：否则 bootstrap 会在已断开的 COM 对象
+                    # 上继续建立订阅并把状态推进到 connected。
+                    raise ConnectionError(
+                        "SyncRead 初始化读取失败（链路故障，{} 个点位）: {}".format(len(chunk), e)
+                    ) from e
                 global_logger.warning(
                     "SyncRead initial values failed for a batch of {}: {}".format(len(chunk), e)
                 )
@@ -1135,6 +1257,7 @@ class OpcDaClientEngine:
         """建立数据变化订阅；服务器不支持 IOPCAsyncIO2 时自动降级为 SyncRead 轮询。"""
         if callback is not None:
             self._sub_callback = callback
+            self._sub_cb_quality_mode = self._callback_quality_mode(callback)
         if not self.nodes:
             global_logger.warning("start_subscription skipped: node list is empty.")
             return
@@ -1163,6 +1286,17 @@ class OpcDaClientEngine:
         except Exception as e:
             if my_gen != self._generation:
                 raise ConnectionSuperseded("subscription superseded during start")
+            code = getattr(e, "code", None)
+            async_unsupported = com.is_async_unsupported_error(code)
+            if not async_unsupported and code is None:
+                # 没有 HRESULT 时只按明确的"不支持异步订阅"文本兜底；其余（OSError/
+                # RPC 异常）一律按链路故障上抛，绝不能靠降级轮询掩盖断线。
+                text = str(e).lower()
+                async_unsupported = ("async unsupported" in text
+                                     or "iopcasyncio2" in text
+                                     or "连接点" in text)
+            if not async_unsupported:
+                raise
             global_logger.warning(
                 "OPC DA 异步订阅不可用（{}）；降级为 SyncRead 轮询，周期 {}ms。".format(
                     e, self.update_rate_ms)
@@ -1201,10 +1335,11 @@ class OpcDaClientEngine:
     async def _poll_loop(self, my_gen):
         """SyncRead 轮询循环（IOPCAsyncIO2 不可用时的降级路径）。"""
         self._poll_started_at = time.monotonic()
-        interval = max(0.05, self.update_rate_ms / 1000.0)
         try:
             while self._poll_started_at and my_gen == self._generation \
                     and self.client is not None and self._link_usable():
+                # 每轮重算周期：设置页热更新 update_rate_ms 后轮询立即生效。
+                interval = max(0.05, self.update_rate_ms / 1000.0)
                 await asyncio.sleep(interval)
                 if my_gen != self._generation or self.client is None or not self._link_usable():
                     break
@@ -1297,8 +1432,9 @@ class OpcDaClientEngine:
             value = getattr(da_value, "value", None)
             timestamp = getattr(da_value, "timestamp", None) or now_ts
 
-            if error:
+            if error and not com.succeeded(error):
                 # 单项读取失败：保留缓存值，不推送，避免界面被清空
+                # （S_FALSE / OPC_S_CLAMP 等正数码是成功提示，不能当失败）
                 global_logger.debug(
                     "Read error for {} (HRESULT=0x{:08X}); cached value kept.".format(
                         node_id, int(error) & 0xFFFFFFFF if isinstance(error, int) else 0)
@@ -1325,15 +1461,21 @@ class OpcDaClientEngine:
                 node["type"] = _python_type_name(value)
             updated += 1
             if dispatch:
-                dispatched.append((node_id, value, timestamp))
+                dispatched.append((node_id, value, timestamp, quality))
 
         if dispatch and dispatched:
             self._last_data_at = time.monotonic()
             callback = self._sub_callback
+            quality_mode = self._sub_cb_quality_mode
             if callable(callback):
-                for node_id, value, timestamp in dispatched:
+                for node_id, value, timestamp, quality in dispatched:
                     try:
-                        callback(node_id, value, timestamp)
+                        if quality_mode == "positional":
+                            callback(node_id, value, timestamp, quality)
+                        elif quality_mode == "keyword":
+                            callback(node_id, value, timestamp, quality=quality)
+                        else:
+                            callback(node_id, value, timestamp)
                     except Exception as e:
                         global_logger.error(
                             "Subscription callback error for {}: {}".format(node_id, e),
@@ -1531,11 +1673,26 @@ class OpcDaClientEngine:
                         state_code = int(state_code)
                     except (TypeError, ValueError):
                         state_code = _OPC_STATE_RUNNING
-                    if state_code == _OPC_STATE_FAILED:
+                    # FAILED / COMM_FAULT 表示服务器已不可用，按断线处理；
+                    # NOCONFIG / SUSPENDED / TEST 仍保留链路但必须告警（旧实现
+                    # 只判断 FAILED，通信故障等异常状态完全没有提示）。
+                    if state_code in (_OPC_STATE_FAILED, _OPC_STATE_COMM_FAULT):
                         raise RuntimeError(
-                            "OPC server state is FAILED ({})".format(
+                            "OPC server state is {} ({})".format(
+                                "FAILED" if state_code == _OPC_STATE_FAILED else "COMM_FAULT",
                                 status.get("state_text") or state_code)
                         )
+                    if state_code in (_OPC_STATE_NOCONFIG, _OPC_STATE_SUSPENDED,
+                                      _OPC_STATE_TEST):
+                        abnormal = "{} ({})".format(
+                            status.get("state_text") or state_code, state_code)
+                        if self._last_abnormal_server_state != abnormal:
+                            self._last_abnormal_server_state = abnormal
+                            global_logger.warning(
+                                "[HEARTBEAT] OPC server state is abnormal: {}; "
+                                "link kept but control/write may be affected.".format(abnormal))
+                    else:
+                        self._last_abnormal_server_state = None
                     self._last_heartbeat_at = time.monotonic()
                     ticks += 1
                     if ticks % 6 == 0:
@@ -1598,7 +1755,12 @@ class OpcDaClientEngine:
         if self._state in (self.STATE_DISCONNECTING, self.STATE_DISCONNECTED):
             return
         was_connected = self._state in (self.STATE_CONNECTED, self.STATE_LOADING)
-        self.reconnect_attempt = 0
+        if not self._in_supervisor:
+            # 手动/心跳检测到的断线从第 1 次重新计数；若异常发生在 supervisor
+            # 自己的重连尝试中（connect 成功但 bootstrap 失败），必须保留当前
+            # 退避计数，交由外层 supervisor 继续递增，否则会一直按 base_delay
+            # 高频重试。
+            self.reconnect_attempt = 0
         self._subscription_mode = None
         self.subscription = None
         if self._auto_reconnect:
@@ -1615,9 +1777,11 @@ class OpcDaClientEngine:
                     global_logger.error(
                         "on_connection_lost callback error: {}".format(e), exc_info=True)
 
-        # supervisor 可能在上一次"还连着"的时候就自然退出，断线时必须确保它重新站起来
-        if self._auto_reconnect and (
-                self._reconnect_task is None or self._reconnect_task.done()):
+        # supervisor 可能在上一次"还连着"的时候就自然退出，断线时必须确保它重新站起来。
+        # 但绝不能在 supervisor 自身仍在执行时再拉起第二个：否则两个 supervisor
+        # 并发重连、共享 _in_supervisor 标志互相覆盖，退避也会被重置。
+        if (self._auto_reconnect and not self._in_supervisor
+                and (self._reconnect_task is None or self._reconnect_task.done())):
             self._reconnect_task = asyncio.create_task(self._reconnect_supervisor())
 
     async def reconnect_forever(self):
@@ -1657,14 +1821,21 @@ class OpcDaClientEngine:
         self._pending_reconnect_forever = None
 
         task = self._reconnect_task
-        self._reconnect_task = None
         if task is None or task.done():
+            self._reconnect_task = None
             return
         try:
-            if task is asyncio.current_task():
-                return
+            current = asyncio.current_task()
         except RuntimeError:
-            pass
+            current = None
+        if task is current:
+            # supervisor 自己在调用 connect()：绝不能先清掉 self._reconnect_task。
+            # 旧实现先置 None 再判断 current_task，导致 supervisor 丢掉自身引用；
+            # 随后 connect 成功但 bootstrap 失败时，_handle_connection_lost 会误判
+            # "没有 supervisor 在跑"而再拉起一个：两个 supervisor 并发，且各自
+            # 从 Attempt 1 重计，指数退避被永久重置。
+            return
+        self._reconnect_task = None
         task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=TASK_CANCEL_GRACE)
@@ -1758,6 +1929,10 @@ class OpcDaClientEngine:
                 exc_info=True,
             )
         finally:
+            current_task = asyncio.current_task()
+            if self._reconnect_task is current_task:
+                # 只清理"自己"的引用：若已有新的 supervisor（异常路径）绝不误清。
+                self._reconnect_task = None
             self._in_supervisor = False
             global_logger.info(
                 "OPC DA auto-reconnect supervisor exited "
@@ -1928,14 +2103,23 @@ class OpcDaClientEngine:
             await self._ensure_link_tasks(my_gen)
             return True
 
-        global_logger.error(
-            "OPC DA write rejected for {} | HRESULT=0x{:08X} {} | {:.1f}ms".format(
+        item_level = com.is_item_level_write_error(hresult)
+        log_fn = global_logger.warning if item_level else global_logger.error
+        log_fn(
+            "OPC DA write rejected{} for {} | HRESULT=0x{:08X} {} | {:.1f}ms".format(
+                "（点位级：只读/类型不匹配/坏点）" if item_level else "",
                 target_display,
                 int(hresult) & 0xFFFFFFFF if isinstance(hresult, int) else 0,
                 error_text or "",
                 elapsed_ms,
             )
         )
+        if item_level:
+            # 点位级拒绝不代表链路故障：绝不能累计到连续写失败计数，否则值守人员
+            # 误点只读布尔点 3 次就会触发整链断开重连（现场已复现）。
+            self._consecutive_write_failures = 0
+            await self._ensure_link_tasks(my_gen)
+            return False
         self._on_write_failure(my_gen)
         # 自愈：写被拒后若链路仍可用，补拉已退出的心跳任务（断线流程里会提前返回）。
         await self._ensure_link_tasks(my_gen)
@@ -2038,11 +2222,24 @@ class OpcDaClientEngine:
                         (entry[1] if entry is not None else "") or "",
                     )
                 )
+            # 区分失败原因：只有链路/传输级失败才累计并触发重连；
+            # 全是点位级拒绝（只读/类型/坏点）时不应把整条连接断开重连。
+            link_failure = False
+            for node_id in failed_ids:
+                entry = result_map.get(str(node_id))
+                code = entry[0] if entry is not None else None
+                if code is None or not com.is_item_level_write_error(code):
+                    link_failure = True
+                    break
             # 只要该批次里任意 1 个点位写入成功，就说明链路健康，重置连续失败计数
             if success_count > 0:
                 self._consecutive_write_failures = 0
-            else:
+            elif link_failure:
                 self._on_write_failure(my_gen)
+            else:
+                global_logger.warning(
+                    "[BATCH_WRITE] All {} failure(s) are item-level (read-only/bad type); "
+                    "link is healthy, not counting as write failure.".format(fail_count))
 
         return success_count, fail_count
 

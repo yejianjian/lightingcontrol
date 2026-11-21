@@ -154,6 +154,10 @@ _LOCAL_HOST_ALIASES = frozenset(
     ('', '.', 'localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0'))
 
 
+_LOCAL_IDENTITY_CACHE = {}
+_LOCAL_IDENTITY_LOCK = threading.Lock()
+
+
 def _local_ip_addresses():
     """收集本机所有网卡地址（多网卡 / LAN IP 都算本机），失败返回空集合。"""
     addresses = set()
@@ -176,8 +180,51 @@ def _local_ip_addresses():
     return addresses
 
 
+def _local_host_identity():
+    """进程内缓存本机名称/地址集合（首次解析后不再阻塞）。
+
+    socket.getaddrinfo()/getfqdn() 在断网或 DNS 缓慢时可能阻塞主线程数秒，而
+    connect() 就发生在 UI/qasync 线程。这里只解析一次并缓存，且不再调用会走 DNS
+    的 getfqdn()。
+    """
+    with _LOCAL_IDENTITY_LOCK:
+        cached = _LOCAL_IDENTITY_CACHE.get('identity')
+        if cached is not None:
+            return cached
+        names = set(_LOCAL_HOST_ALIASES)
+        addresses = set(_LOCAL_HOST_ALIASES)
+        try:
+            hostname = socket.gethostname().lower()
+            names.add(hostname)
+        except Exception:  # pragma: no cover
+            hostname = ''
+        # 本机完整计算机名（FQDN）：用 Windows API 从本机注册表读取，**不做 DNS**。
+        # 这样用户填本机 FQDN 仍能识别为本机，同时不会像"短名前缀匹配"那样把
+        # 远程主机 opc.site2.local 误判成本机 opc。
+        try:
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(256)
+            size = ctypes.c_ulong(len(buffer))
+            # ComputerNameDnsFullyQualified = 3
+            if (ctypes.windll.kernel32.GetComputerNameExW(
+                    3, buffer, ctypes.byref(size)) and buffer.value):
+                fqdn = str(buffer.value).strip().lower()
+                if fqdn:
+                    names.add(fqdn)
+        except Exception:  # pragma: no cover - 非 Windows/极端环境
+            pass
+        addresses.update(_local_ip_addresses())
+        identity = (names, addresses, hostname)
+        _LOCAL_IDENTITY_CACHE['identity'] = identity
+        return identity
+
+
 def _is_local_host(host):
-    """判断主机名/IP 是否指向本机（None/空/localhost/回环/主机名/任一网卡 IP）。"""
+    """判断主机名/IP 是否指向本机（None/空/localhost/回环/主机名/任一网卡 IP）。
+
+    不在本函数里对任意远程主机做 DNS 解析：解析失败/缓慢会阻塞 UI 线程，而且把
+    远程主机误判成本机反而危险。IP 字面量与缓存的本机名称/网卡地址直接比较即可。
+    """
     if host is None:
         return True
     text = str(host).strip().lower()
@@ -187,32 +234,34 @@ def _is_local_host(host):
     if candidate.startswith('[') and candidate.endswith(']'):
         candidate = candidate[1:-1]
     candidate = candidate.split('%', 1)[0]  # 去掉 IPv6 zone id（fe80::1%12）
-    if candidate.startswith('127.'):
+    if candidate.startswith('127.') or candidate == '::1':
         return True
-    names = set()
-    try:
-        hostname = socket.gethostname()
-        names.add(hostname.lower())
-        fqdn = socket.getfqdn()
-        if fqdn:
-            names.add(fqdn.lower())
-    except Exception:  # pragma: no cover
-        pass
-    addresses = _local_ip_addresses()
+    names, addresses, hostname = _local_host_identity()
     if candidate in names or candidate in addresses:
         return True
-    # 用户填的是别名/域名：解析后只要落在本机任一网卡或回环上就按本机处理
-    try:
-        for info in socket.getaddrinfo(candidate, None):
-            sockaddr = info[4] if len(info) > 4 else None
-            if not sockaddr or not sockaddr[0]:
-                continue
-            ip = str(sockaddr[0]).split('%', 1)[0].lower()
-            if ip in addresses or ip.startswith('127.') or ip == '::1':
-                return True
-    except Exception:
-        pass
+    # 注意：不能只比较短名首段（candidate.split('.')[0] == hostname）。
+    # 若本机名恰好是 opc，而目标是远程主机 opc.site2.local，会被误判成本机，
+    # 从而忽略 DCOM 的 machine 参数去连本机（或本机枚举），造成"连错机器"。
+    # 精确 FQDN 匹配需要 DNS，已在 _local_host_identity() 中明确避免；因此这里
+    # 只认精确主机名/网卡地址，宁可把本机 FQDN 当作远程（DCOM 连本机同样可用）。
     return False
+
+
+def _move_variant_into_slot(array, position, variant):
+    """把独立 VARIANT 移入 VARIANT 数组槽位（转移 BSTR/SAFEARRAY 所有权）。
+
+    ctypes 数组元素赋值是浅拷贝：槽位接管了指针，但原 VARIANT 仍保持 VT_BSTR
+    且 _b_needsfree_=1，其析构会再次 VariantClear 同一 BSTR -> double free / 堆
+    破坏（写字符串点位后进程偶发崩溃的根因）。这里复制后立即把原 VARIANT 置空，
+    释放统一由数组元素负责。
+
+    独立成模块级函数便于单元测试这条所有权转移语义。
+    """
+    array[position] = variant
+    try:
+        variant.vt = com.VT_EMPTY
+    except Exception:  # pragma: no cover - 防御性
+        pass
 
 
 def _com_error_code(exc):
@@ -432,6 +481,10 @@ class OpcDaClient(object):
         except Exception as exc:
             code = _com_error_code(exc) or com.E_NOINTERFACE
             self._release_com_objects()
+            # 局部引用必须在 CoUninitialize() 之前释放：否则函数退出时才执行
+            # IUnknown::Release()，相当于在 COM 套间已反初始化后再调 COM（不安全）。
+            unknown = None
+            server = None
             com.uninitialize_com()
             self._thread_id = None
             raise OpcDaError(
@@ -460,6 +513,9 @@ class OpcDaClient(object):
             self._read_server_status()
         except OpcDaError:
             self._release_com_objects()
+            # 同 QueryInterface 失败路径：先释放局部 COM 引用再 CoUninitialize。
+            unknown = None
+            server = None
             com.uninitialize_com()
             self._thread_id = None
             raise
@@ -823,6 +879,22 @@ class OpcDaClient(object):
         self._group_rate_ms = new_rate
         logger.debug('组更新周期已调整为 %dms（请求 %dms）', new_rate, rate)
 
+    def set_update_rate_ms(self, rate):
+        """已连接状态下原地调整采样/推送周期（不重建组、不中断订阅）。
+
+        返回服务器实际确认的周期；未建组时返回请求值（下一次 AddItems 时生效）。
+        """
+        try:
+            rate = int(rate)
+        except (TypeError, ValueError):
+            return self._group_rate_ms
+        if rate <= 0:
+            return self._group_rate_ms
+        if self._group_unknown is None:
+            return rate
+        self._ensure_group(rate)
+        return self._group_rate_ms
+
     # ---------------------------------------------------------------- 添加点位
 
     def add_items(self, item_ids, update_rate_ms=DEFAULT_UPDATE_RATE_MS):
@@ -1030,7 +1102,9 @@ class OpcDaClient(object):
         try:
             for index, (_, item_id) in enumerate(chunk):
                 code = com.as_unsigned(errors[index]) if errors else 0
-                if code:
+                # 用 succeeded() 判断：S_FALSE / OPC_S_CLAMP 等正数 HRESULT 是
+                # 『成功但有限幅提示』，旧写法 if code: 会把它们当失败丢弃数值。
+                if not com.succeeded(code):
                     values.append(DaValue(item_id=item_id, value=None, quality=0,
                                           timestamp=None, error=code))
                     continue
@@ -1063,8 +1137,9 @@ class OpcDaClient(object):
         :param values: {item_id: value} 映射
         :return: [(item_id, hresult, error_text), ...]，顺序与传入映射一致；
                  hresult==0 表示写入成功
-        :raises OpcDaError: 值类型无法安全转换（含数组类型点位）时直接失败，
-            不会尝试构造可能崩溃的 SAFEARRAY；未挂载/只读点位作为逐项错误返回
+        :raises OpcDaError: 仅当整批 COM 调用本身失败（链路问题）时抛出。
+            未挂载/只读/数组类型/值类型无法转换均作为**单项错误**返回，不影响同批
+            其他点位的下发（现场曾因一个数组点位导致同组 99 个灯控点全部不执行）。
         """
         self._check_ready()
         mapping = list(values.items()) if values else []
@@ -1093,22 +1168,30 @@ class OpcDaClient(object):
                 results[index] = (item_id, com.OPC_E_BADRIGHTS,
                                   '点位不可写（access=%d）' % item.access)
                 continue
-            # 数组/无法安全构造 VARIANT 的类型必须显式中断：实测写 SAFEARRAY
-            # 会在 comtypes 里触发解释器级崩溃，绝不能让 UI 线程走到那一步。
+            # 数组/无法安全构造 VARIANT 的类型必须跳过：实测构造 SAFEARRAY(VARIANT)
+            # 会在 comtypes 里触发解释器级崩溃。这里作为单项错误返回，继续处理同批
+            # 其他正常点位（批量/定时任务不会因为一个坏点而全部不执行）。
             if item.canonical_vt & com.VT_ARRAY:
-                raise OpcDaError(
-                    'unsupported data type for write: 数组类型点位暂不支持写值'
-                    '（item_id=%s, canonical_vt=0x%04X）' % (item_id, item.canonical_vt))
+                results[index] = (
+                    item_id, com.OPC_E_BADTYPE,
+                    '数组类型点位暂不支持写值（canonical_vt=0x%04X）' % item.canonical_vt)
+                logger.warning('跳过数组类型点位写入：%s（canonical_vt=0x%04X）',
+                               item_id, item.canonical_vt)
+                continue
             try:
                 variant = com.python_to_variant(value, item.canonical_vt)
             except (ValueError, TypeError) as exc:
-                raise OpcDaError(
-                    'unsupported data type for write: %s'
-                    '（item_id=%s, canonical_vt=0x%04X）' % (
-                        exc, item_id, item.canonical_vt))
+                results[index] = (
+                    item_id, com.OPC_E_BADTYPE,
+                    '值类型无法转换为点位类型：%s（canonical_vt=0x%04X）' % (
+                        exc, item.canonical_vt))
+                logger.warning('跳过类型不兼容的点位写入：%s（%s）', item_id, exc)
+                continue
             except Exception as exc:  # pragma: no cover - 防御性
-                raise OpcDaError(
-                    'unsupported data type for write: %s（item_id=%s）' % (exc, item_id))
+                results[index] = (
+                    item_id, com.E_FAIL, '构造写入值失败：%s' % exc)
+                logger.warning('构造点位写入值失败：%s（%s）', item_id, exc)
+                continue
             valid.append((index, item_id, item, variant))
 
         if not valid:
@@ -1121,7 +1204,12 @@ class OpcDaClient(object):
         try:
             for position, (_, _, item, variant) in enumerate(valid):
                 handles[position] = item.server_handle
-                variants[position] = variant
+                # 注意：ctypes 数组元素赋值是**浅拷贝**，数组元素接管了 VARIANT 里的
+                # BSTR/SAFEARRAY 指针。若原 VARIANT 仍保持 VT_BSTR 且 _b_needsfree_=1，
+                # 其析构时会对同一指针再次 VariantClear（double free / 堆破坏，
+                # 现场表现为写字符串点位后进程直接崩溃）。写完立即把原对象置空，
+                # 完成所有权转移；释放统一由下方 variants 数组负责。
+                _move_variant_into_slot(variants, position, variant)
             array_ready = True
             for start in range(0, count, DEFAULT_BATCH_SIZE):
                 chunk_len = min(DEFAULT_BATCH_SIZE, count - start)
@@ -1270,8 +1358,9 @@ class OpcDaClient(object):
             if item_id is None:
                 continue
             code = com.as_unsigned(errors[index]) if errors else 0
+            ok = com.succeeded(code)  # S_FALSE/OPC_S_CLAMP 等正数码是成功提示
             try:
-                value = None if code else com.variant_to_python(values[index])
+                value = com.variant_to_python(values[index]) if ok else None
             except Exception:  # pragma: no cover - 防御性
                 value = None
             data.append(DaValue(
@@ -1280,7 +1369,7 @@ class OpcDaClient(object):
                 quality=int(qualities[index]) if qualities else 0,
                 timestamp=(com.filetime_to_local_string(timestamps[index])
                            if timestamps else None),
-                error=code,
+                error=0 if ok else code,
             ))
         if not data:
             return

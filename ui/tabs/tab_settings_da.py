@@ -10,8 +10,8 @@
 重连策略、界面设置、状态机投影、按钮行为全部复用父类，保证 UA / DA 两版设置页
 的行为一致（"断线后自动重连"、"连接/停止重连"按钮语义等）。
 
-COM/枚举说明：list_servers() 可能在远程 DCOM 主机上阻塞数秒，因此放进 QThread
-执行，绝不阻塞 Qt 主线程（主线程还负责 COM 消息泵与订阅回调）。
+COM/枚举说明：list_servers() 可能在远程 DCOM 主机上阻塞数秒，因此放进 daemon
+后台线程执行，绝不阻塞 Qt 主线程（主线程还负责 COM 消息泵与订阅回调）。
 """
 
 try:
@@ -19,16 +19,17 @@ try:
         QGroupBox, QFormLayout, QLineEdit, QComboBox, QPushButton, QLabel,
         QSpinBox, QHBoxLayout, QMessageBox, QListWidget, QListWidgetItem,
     )
-    from PyQt5.QtCore import QThread, Qt, pyqtSignal
+    from PyQt5.QtCore import QObject, Qt, pyqtSignal
 except ImportError:
     from PySide6.QtWidgets import (
         QGroupBox, QFormLayout, QLineEdit, QComboBox, QPushButton, QLabel,
         QSpinBox, QHBoxLayout, QMessageBox, QListWidget, QListWidgetItem,
     )
-    from PySide6.QtCore import QThread, Qt, Signal as pyqtSignal
+    from PySide6.QtCore import QObject, Qt, Signal as pyqtSignal
 
 import asyncio
 import re
+import threading
 
 from ui.tabs.tab_settings import TabSettings
 from utils.logger import global_logger
@@ -40,20 +41,57 @@ _HOSTNAME_PATTERN = re.compile(
     r"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?"
     r"(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
 )
-# OPC ProgID 形如 Matrikon.OPC.Simulation.1 / Kepware.KEPServerEX.V6
-_PROGID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+(\.[A-Za-z0-9_\-]+)+$")
+# OPC ProgID 形如 Matrikon.OPC.Simulation.1 / Kepware.KEPServerEX.V6；
+# 部分服务器只登记了 CLSID，因此同时接受 {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}。
+# 普通 ProgID 允许空格、点、下划线、连字符（例如 "Rockwell Automation.Tag.1"）。
+_PROGID_PATTERN = re.compile(
+    r"^(?:\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}"
+    r"|[A-Za-z0-9_\- ]+(?:\.[A-Za-z0-9_\- ]+)+)$"
+)
+
+# 枚举任务保活集合：使用普通 daemon 线程而不是 QThread。
+# 远程 DCOM / Remote Registry 枚举可能阻塞数十秒；QThread 若在窗口/解释器销毁
+# 时仍持有运行中的 Qt 线程，会触发 "QThread: Destroyed while thread is still
+# running"（Qt 直接 abort，无法被 Python try/except 捕获）。daemon 线程不持有
+# Qt 线程对象，进程退出时由 OS 回收，从根上消除该崩溃路径。
+_RUNNING_WORKERS = set()
 
 
-class _ServerListWorker(QThread):
-    """后台枚举 OPC DA 服务器列表（避免 DCOM 枚举阻塞 GUI 线程）。"""
+class _ServerListWorker(QObject):
+    """后台枚举 OPC DA 服务器列表（daemon 线程，不阻塞 GUI 线程）。"""
 
     finished_list = pyqtSignal(list, str)
+    finished = pyqtSignal()
 
     def __init__(self, host, parent=None):
         super().__init__(parent)
         self.host = host
+        self._thread = None
 
-    def run(self):
+    def isRunning(self):
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _release_keepalive_on_gui(self):
+        """在 GUI 线程释放保活引用（由 finished 信号排队触发）。"""
+        _RUNNING_WORKERS.discard(self)
+
+    def start(self):
+        """启动枚举线程；两个 Qt 信号会自动以队列方式回到 GUI 线程。"""
+        if self.isRunning():
+            return
+        _RUNNING_WORKERS.add(self)
+        # 线程结束后由 GUI 线程释放保活引用并 deleteLater。QObject 归属 GUI 线程，
+        # 绝不能在 daemon 线程里 discard 掉最后一个强引用（否则可能在非所属线程
+        # 析构 QObject，与排队中的 deleteLater 竞争）。即使解释器已退出、队列未
+        # 处理，daemon 线程也不会阻止进程结束。
+        self.finished.connect(self._release_keepalive_on_gui)
+        self.finished.connect(self.deleteLater)
+        self._thread = threading.Thread(
+            target=self._run, name="opcda-server-enum", daemon=True)
+        self._thread.start()
+
+    def _run(self):
         try:
             # 延迟导入：opcda.client 依赖 comtypes（仅 Windows）。
             # list_servers 契约要求任何失败返回 []、不抛异常；这里仍兜一层，
@@ -61,9 +99,19 @@ class _ServerListWorker(QThread):
             from opcda.client import list_servers
 
             servers = list_servers(self.host) or []
-            self.finished_list.emit([str(name) for name in servers], "")
+            payload = ([str(name) for name in servers], "")
         except Exception as exc:  # pragma: no cover - 依赖真实 COM 环境
-            self.finished_list.emit([], "{}: {}".format(type(exc).__name__, exc))
+            payload = ([], "{}: {}".format(type(exc).__name__, exc))
+        try:
+            self.finished_list.emit(*payload)
+        except Exception:  # pragma: no cover - 接收方已销毁
+            pass
+        try:
+            self.finished.emit()
+        except Exception:  # pragma: no cover
+            pass
+        # 注意：不在这里 _RUNNING_WORKERS.discard(self)。保活引用必须由 GUI 线程
+        # 的 _release_keepalive_on_gui() 释放，避免在后台线程析构 QObject。
 
 
 class DaTabSettings(TabSettings):
@@ -72,6 +120,8 @@ class DaTabSettings(TabSettings):
     def __init__(self, opc_engine, data_manager):
         self._server_worker = None
         self._manual_tasks = set()
+        # 手动点位在线挂载/删除任务进行中标志：防止快速连击并发创建多个 live 任务。
+        self._manual_busy = False
         # 手动点位必须在父类构造（可能调度自动连接）之前从配置读入，
         # 并尽早注入引擎，否则冷启动自动连接的第一轮 bootstrap 会漏挂。
         self._manual_entries = self._normalize_manual_entries(
@@ -160,6 +210,9 @@ class DaTabSettings(TabSettings):
         self.sb_update_rate.setValue(
             int(saved_conn.get("update_rate_ms", getattr(self.engine, "update_rate_ms", 500)))
         )
+        # 关键顺序：先 setValue 再 connect，避免构造时把持久化值当成用户修改而误触发。
+        # 已连接时用户改更新周期必须立即生效，否则要重启程序才能应用。
+        self.sb_update_rate.valueChanged.connect(self._on_update_rate_changed)
 
         # 浏览深度：地址空间递归层数
         self.sb_browse_depth = QSpinBox()
@@ -194,6 +247,43 @@ class DaTabSettings(TabSettings):
 
         layout.addWidget(grp_conn)
         return grp_conn
+
+    def _on_update_rate_changed(self, value):
+        """更新周期热更新：已连接时立即调整底层订阅/轮询的采样间隔。
+
+        离线时只改界面值即可（连接成功后 _persist_connection_params 会落盘）；
+        24/7 现场改完周期不应要求重启程序，因此已连接时调用 engine.configure()
+        让引擎把新周期下发给底层 client。
+        """
+        requested = int(value)
+        if not getattr(self.engine, "connected", False):
+            return
+        try:
+            self.engine.configure(update_rate_ms=requested)
+        except Exception as e:
+            global_logger.error("热更新 OPC DA 更新周期失败: {}".format(e), exc_info=True)
+            self.lbl_conn_status.setText("更新周期应用失败：{}".format(e))
+            return
+        # 服务器可能拒绝/钳制请求值（SetState 返回 RevisedUpdateRate）；持久化与
+        # 提示必须以引擎实际生效值为准，不能把输入值当成已生效值。
+        try:
+            effective = int(getattr(self.engine, "update_rate_ms", requested) or requested)
+        except (TypeError, ValueError):
+            effective = requested
+        conn = dict(self.dm.pm.data_store.get("da_connection", {}) or {})
+        conn["update_rate_ms"] = effective
+        self.dm.pm.data_store["da_connection"] = conn
+        self.dm.pm.save()
+        endpoint = getattr(self.engine, "display_endpoint", "") or ""
+        prefix = "已连接 {} | ".format(endpoint) if endpoint else ""
+        if effective == requested:
+            self.lbl_conn_status.setText("{}更新周期已应用 {}ms".format(prefix, effective))
+        else:
+            self.lbl_conn_status.setText(
+                "{}更新周期已应用 {}ms（请求 {}ms，服务器已确认）".format(
+                    prefix, effective, requested))
+        global_logger.info(
+            "OPC DA 更新周期热更新：请求 {}ms，实际生效 {}ms".format(requested, effective))
 
 
     # ----------------------------------------------------------------------------------
@@ -295,8 +385,13 @@ class DaTabSettings(TabSettings):
         self.dm.pm.data_store["da_manual_nodes"] = [dict(entry) for entry in self._manual_entries]
         self.dm.pm.save()
 
-    def _spawn_manual_task(self, coro):
-        """把手动点位的异步挂载/删除交给事件循环，并保留强引用避免被 GC。"""
+    def _spawn_manual_task(self, coro, on_done=None):
+        """把手动点位的异步挂载/删除交给事件循环，并保留强引用避免被 GC。
+
+        :param on_done: 任务结束（成功 / 失败 / 取消）后的回调。用于恢复按钮可用
+            状态；原先只 discard 强引用，异常路径没有机会恢复 UI。
+        :return: 创建成功的 Task；事件循环未就绪时返回 None。
+        """
         try:
             loop = asyncio.get_event_loop()
             task = loop.create_task(coro)
@@ -306,11 +401,36 @@ class DaTabSettings(TabSettings):
                 coro.close()
             except Exception:
                 pass
-            return
+            return None
         self._manual_tasks.add(task)
-        task.add_done_callback(self._manual_tasks.discard)
+
+        def _finish(t):
+            self._manual_tasks.discard(t)
+            if on_done is not None:
+                try:
+                    on_done(t)
+                except Exception as e:  # pragma: no cover - 防御性
+                    global_logger.warning("Manual point done-callback failed: {}".format(e))
+
+        task.add_done_callback(_finish)
+        return task
+
+    def _set_manual_busy(self, busy):
+        """手动点位 live 任务进行中禁用「添加点位 / 删除选中」两个按钮。"""
+        self._manual_busy = bool(busy)
+        for name in ("btn_manual_add", "btn_manual_remove"):
+            btn = getattr(self, name, None)
+            if btn is not None:
+                btn.setEnabled(not self._manual_busy)
+
+    def _on_manual_task_done(self, task=None):
+        """手动点位 live 任务结束（含异常/取消）后恢复按钮。"""
+        self._set_manual_busy(False)
 
     def _on_add_manual_point(self):
+        if self._manual_busy:
+            # 上一个挂载/删除任务还没结束：忽略连击，避免并发创建多个 live 任务。
+            return
         item_id = self.le_manual_item_id.text().strip()
         if not item_id:
             QMessageBox.warning(self, "ItemID 为空", "请输入 OPC DA 的完整 ItemID，例如 Random.Int1。")
@@ -328,8 +448,13 @@ class DaTabSettings(TabSettings):
 
         if self.engine.connected:
             self.lbl_manual_status.setText("正在向服务器挂载 {} ...".format(item_id))
-            self._spawn_manual_task(self._add_manual_point_live(item_id, name))
+            self._set_manual_busy(True)
+            task = self._spawn_manual_task(
+                self._add_manual_point_live(item_id, name), self._on_manual_task_done)
+            if task is None:  # 事件循环未就绪：没有任务可等，立刻恢复按钮
+                self._set_manual_busy(False)
         else:
+            # 离线添加只改配置，不联网、不置忙，保持原有行为。
             self.lbl_manual_status.setText("已保存；连接成功后会自动挂载 {}".format(item_id))
         global_logger.info("Manual OPC DA point saved: {} ({})".format(item_id, name))
 
@@ -350,6 +475,9 @@ class DaTabSettings(TabSettings):
                 "挂载失败：{}（已保存，可删除后重试）".format(e))
 
     def _on_remove_manual_point(self):
+        if self._manual_busy:
+            # 与添加共用同一个 busy 标志：连击时不会并发创建多个 RemoveItems 任务。
+            return
         selected = self.list_manual_points.selectedItems()
         if not selected:
             QMessageBox.information(self, "未选择点位", "请先在上方列表中选择要删除的手动点位。")
@@ -365,7 +493,11 @@ class DaTabSettings(TabSettings):
         # 即使当前未连接，也要让引擎从 nodes 中移除（断线期间删除的点位不能在
         # 下次连接时被 AddItems 复活）；引擎内部会自动判断是否需要 RemoveItems。
         self.lbl_manual_status.setText("正在移除 {} ...".format(", ".join(item_ids)))
-        self._spawn_manual_task(self._remove_manual_points_live(item_ids))
+        self._set_manual_busy(True)
+        task = self._spawn_manual_task(
+            self._remove_manual_points_live(item_ids), self._on_manual_task_done)
+        if task is None:  # 事件循环未就绪：立刻恢复按钮
+            self._set_manual_busy(False)
         global_logger.info("Manual OPC DA point(s) removed from config: {}".format(item_ids))
 
     async def _remove_manual_points_live(self, item_ids):
@@ -404,15 +536,24 @@ class DaTabSettings(TabSettings):
             .format(host))
         global_logger.info("Enumerating OPC DA servers on host {} ...".format(host))
 
-        worker = _ServerListWorker(host, self)
+        # parent=None + 模块级保活集合：线程对象活到 run() 返回。关闭主窗口时
+        # Qt 不会随父对象销毁仍在枚举远程 DCOM/Remote Registry 的线程，从而避免
+        # "QThread: Destroyed while thread is still running" 崩溃。
+        worker = _ServerListWorker(host)
         worker.finished_list.connect(self._on_server_list_ready)
         worker.finished.connect(self._on_server_worker_finished)
         self._server_worker = worker
+        self._server_scan_host = host  # 结果回显用，避免依赖 worker 生命周期
+        _RUNNING_WORKERS.add(worker)
         worker.start()
 
     def _on_server_list_ready(self, servers, error):
         current = self.cb_prog_id.currentText().strip()
-        host = self.le_da_host.text().strip() or "localhost"
+        # 用本次实际扫描的主机回显结果：枚举期间用户可能已改输入框，若再读控件
+        # 会出现"提示说 A 主机、实际扫的是 B 主机"的误导。
+        worker = self._server_worker
+        host = (worker.host if worker is not None
+                else getattr(self, "_server_scan_host", "") or "(未知主机)")
         if servers:
             existing = {self.cb_prog_id.itemText(i) for i in range(self.cb_prog_id.count())}
             for name in servers:
@@ -461,8 +602,65 @@ class DaTabSettings(TabSettings):
             )
 
     def _on_server_worker_finished(self):
-        self.btn_refresh_servers.setEnabled(True)
-        self.btn_refresh_servers.setText("刷新服务器列表")
+        """枚举线程结束：从保活集合移除、安排销毁，并恢复"刷新服务器列表"按钮。"""
+        worker = self._server_worker
+        self._server_worker = None
+        if worker is not None:
+            _RUNNING_WORKERS.discard(worker)
+            try:
+                worker.deleteLater()
+            except RuntimeError:  # 对象已随窗口销毁
+                pass
+        try:
+            self.btn_refresh_servers.setEnabled(True)
+            self.btn_refresh_servers.setText("刷新服务器列表")
+        except RuntimeError:  # 退出阶段控件已销毁：忽略
+            pass
+
+    def shutdown_background_tasks(self):
+        """由顶层窗口关闭流程调用：解绑枚举回调并取消手动点位任务。
+
+        QTabWidget 子页面通常收不到主窗口的 closeEvent，因此不能依赖
+        DaTabSettings.closeEvent；由 MainWindow.closeEvent 显式调用本方法，
+        避免枚举/手动点位回调进入已销毁的界面。
+        """
+        worker = self._server_worker
+        self._server_worker = None
+        if worker is not None:
+            for signal, slot in (
+                    (worker.finished_list, self._on_server_list_ready),
+                    (worker.finished, self._on_server_worker_finished)):
+                try:
+                    signal.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+        for task in list(self._manual_tasks):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self._manual_tasks.clear()
+
+    def closeEvent(self, event):
+        """关闭设置页时解绑枚举结果信号，绝不同步等待后台线程。"""
+        worker = self._server_worker
+        if worker is not None:
+            try:
+                worker.finished_list.disconnect(self._on_server_list_ready)
+            except (TypeError, RuntimeError):
+                pass
+        super().closeEvent(event)
+
+    def _log_empty_node_tree(self):
+        """DA 版点位表为空多数是正常状态（例如刚删掉最后一个手动点位）。
+
+        父类给的是 WARNING 并要求排查"命名空间前缀（UA 专用）"，对 DA 会误导现场；
+        这里降为 info，只提示点位数空的真实原因与可继续的操作。
+        """
+        global_logger.info(
+            "当前没有点位：自动扫描为空且未配置手动点位，或点位刚被移除；"
+            "DA 版删除手动点位后空表属于正常，可继续添加点位或刷新服务器列表。"
+        )
 
     # ----------------------------------------------------------------------------------
     # 表单校验 / 注入 / 持久化（覆盖父类）
@@ -478,7 +676,8 @@ class DaTabSettings(TabSettings):
         if not prog_id or not _PROGID_PATTERN.match(prog_id):
             return self._fail(
                 "ProgID 错误",
-                "请输入合法的 OPC Server ProgID，例如 Matrikon.OPC.Simulation.1。",
+                "请输入合法的 OPC Server ProgID（例如 Matrikon.OPC.Simulation.1），"
+                "或 {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} 形式的 CLSID。",
                 interactive=interactive,
             )
 

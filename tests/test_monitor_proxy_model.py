@@ -6,15 +6,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from PyQt5.QtWidgets import QApplication
-    from PyQt5.QtCore import QModelIndex
+    from PyQt5.QtCore import QModelIndex, Qt
+    from PyQt5.QtGui import QColor
 except ImportError:
     from PySide6.QtWidgets import QApplication
-    from PySide6.QtCore import QModelIndex
+    from PySide6.QtCore import QModelIndex, Qt
+    from PySide6.QtGui import QColor
 
 from core.data_manager import DataManager
 from utils.persistence import PersistenceManager
 from ui.tabs.tab_monitor import MonitorTableModel, MonitorSearchProxyModel
-from ui.components.action_delegate import _get_node_from_index
+from ui.components.action_delegate import _get_node_from_index, _is_node_writable
 
 class TestMonitorProxyModel(unittest.TestCase):
     @classmethod
@@ -82,6 +84,60 @@ class TestMonitorProxyModel(unittest.TestCase):
             os.remove(test_file)
         if os.path.exists(test_file + ".bak"):
             os.remove(test_file + ".bak")
+
+    def test_status_column_shows_bad_quality(self):
+        """质量非 Good 时状态列必须显示（通信异常），并保持颜色/布尔格式兼容。"""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="lc_monitor_q_") as tmp:
+            pm = PersistenceManager(os.path.join(tmp, "cfg.json"))
+            dm = DataManager(pm)
+            dm.update_node("ns=2;s=Q_Bad", {"name": "Q_Bad", "alias": "坏质量",
+                                            "type": "Real", "value": 12.5, "quality": 0x0018})
+            dm.update_node("ns=2;s=Q_Uncertain", {"name": "Q_Uncertain", "alias": "不确定",
+                                                  "type": "Real", "value": 3.0, "quality": 0x0040})
+            dm.update_node("ns=2;s=Q_None", {"name": "Q_None", "alias": "无值坏质量",
+                                             "type": "Real", "value": None, "quality": 0x0000})
+            dm.update_node("ns=2;s=Q_Good", {"name": "Q_Good", "alias": "好质量",
+                                             "type": "Real", "value": 220.5, "quality": 0x00C0})
+            dm.update_node("ns=2;s=Q_Bool", {"name": "Q_Bool", "alias": "布尔坏质量",
+                                             "type": "Boolean", "value": True, "quality": 0x0000})
+
+            model = MonitorTableModel(dm)
+            model.refresh_data()
+            self.assertEqual(model.columnCount(), 6)  # 列数不变
+            row_map = {n.get('node_id'): i for i, n in enumerate(model._data_cache)}
+
+            def cell(node_id):
+                idx = model.index(row_map[node_id], 3)
+                return (model.data(idx, Qt.DisplayRole),
+                        model.data(idx, Qt.ForegroundRole))
+
+            text, color = cell("ns=2;s=Q_Bad")
+            self.assertEqual(text, "12.5（通信异常）")
+            self.assertEqual(color.name(), QColor("red").name())
+
+            text, _ = cell("ns=2;s=Q_None")
+            self.assertEqual(text, "通信异常")
+
+            text, color = cell("ns=2;s=Q_Uncertain")
+            self.assertEqual(text, "3.0（通信异常）")
+            self.assertEqual(color.name(), QColor("orange").name())
+
+            text, _ = cell("ns=2;s=Q_Good")
+            self.assertEqual(text, "220.5")
+
+            text, _ = cell("ns=2;s=Q_Bool")
+            self.assertEqual(text, "开启（通信异常）")
+
+    def test_readonly_nodes_not_clickable(self):
+        """DA 的 writable=False 必须判为只读；UA 缺字段按可写处理（兼容）。"""
+        self.assertFalse(_is_node_writable({"type": "Boolean", "writable": False}))
+        self.assertTrue(_is_node_writable({"type": "Boolean", "writable": True}))
+        self.assertTrue(_is_node_writable({"type": "Boolean"}))  # UA 版无 writable 字段
+        self.assertFalse(_is_node_writable({"writable": False, "access": 3}))
+        self.assertFalse(_is_node_writable({"access": 0x01}))
+        self.assertFalse(_is_node_writable({"access": "ReadOnly"}))
+        self.assertTrue(_is_node_writable({"access": 0x03}))
 
 if __name__ == "__main__":
     unittest.main()
