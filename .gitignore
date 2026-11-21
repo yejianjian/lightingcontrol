@@ -4,36 +4,40 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+# Virtual Environments
 env/
 venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.cache
-nosetests.xml
-coverage.xml
-*,cover
-.hypothesis/
-.pytest_cache/
+venv*/
 
 # PyInstaller
-#  通常这些文件由 PyInstaller 自动生成
 build/
 dist/
-*.spec
 
-# Logs
+# Logs & temp files
 logs/
 *.log
+*.tmp
+*.bak
+tmp_*
+.pytest_cache/
+.renewal_test_tmp/
 
-# Editors
+# Editors & Tools
 .vscode/
 .idea/
+.claude/
+.freebuff/
 *.swp
 *.swo
 
-# Project specific
-database/*.db
-server_cert_0.der
+# Project specific security & local runtime files
+client_key.pem
+client_cert.der
+client_cert.der.tmp
 server_key_0.pem
+server_cert_0.der
+server_cert_0.der.tmp
+# 证书轮换/配置损坏时引擎自动留下的取证副本
+*.der.stale
+*.corrupt
+database/*.db
